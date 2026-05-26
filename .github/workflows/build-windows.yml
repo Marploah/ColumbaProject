@@ -45,19 +45,20 @@ jobs:
         uses: actions/cache@v4
         with:
           path: src-tauri/binaries/llama-server-x86_64-pc-windows-msvc.exe
-          key: llama-server-b5535-windows-avx2
+          key: llama-server-b9351-windows-cpu-x64
 
       - name: Download llama-server
         if: steps.cache-llama.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path src-tauri/binaries
-          $tag = "b5535"
-          $zip = "llama-$tag-bin-win-avx2-x64.zip"
-          $url = "https://github.com/ggerganov/llama.cpp/releases/download/$tag/$zip"
+          $tag = "b9351"
+          $zip = "llama-$tag-bin-win-cpu-x64.zip"
+          $url = "https://github.com/ggml-org/llama.cpp/releases/download/$tag/$zip"
           Invoke-WebRequest -Uri $url -OutFile llama.zip
           Expand-Archive llama.zip -DestinationPath llama-bin
-          Copy-Item llama-bin/llama-server.exe src-tauri/binaries/llama-server-x86_64-pc-windows-msvc.exe
+          $server = Get-ChildItem -Recurse -Filter "llama-server.exe" llama-bin | Select-Object -First 1
+          Copy-Item $server.FullName src-tauri/binaries/llama-server-x86_64-pc-windows-msvc.exe
 
       - name: Cache model GGUF
         id: cache-model
@@ -72,7 +73,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path src-tauri/resources/models
           $url = "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
-          Invoke-WebRequest -Uri $url -OutFile src-tauri/resources/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
+          curl.exe -L -o src-tauri/resources/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf $url
 
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
