@@ -1,0 +1,7 @@
+/backend/target/
+/src-tauri/target/
+/frontend/node_modules/
+/frontend/dist/
+.env
+.env.*
+/frontend/tsconfig.tsbuildinfo

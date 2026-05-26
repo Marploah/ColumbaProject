@@ -1,0 +1,30 @@
+[package]
+name = "columba-backend"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "columba_backend"
+path = "src/lib.rs"
+
+[[bin]]
+name = "columba-backend"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-openai = "0.26"
+axum = { version = "0.7", features = ["ws"] }
+futures-util = "0.3"
+regex = "1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ta = "0.5"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tower-http = { version = "0.6", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
