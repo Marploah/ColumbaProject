@@ -10,6 +10,7 @@ export class SimulationEngine {
   public entryPrice = 0;
   public takeProfit = 0;
   public stopLoss = 0;
+  public onAlert?: (message: string) => void;
 
   public armTrade(parameters: TradeParameters): void {
     this.isActive = true;
@@ -34,7 +35,7 @@ export class SimulationEngine {
 
     if (!this.hasTriggeredEntry && this.hasReachedEntry(lastPrice)) {
       this.hasTriggeredEntry = true;
-      window.alert(`Trade entry triggered at ${lastPrice.toFixed(2)}`);
+      this.onAlert?.(`Trade entry triggered at ${lastPrice.toFixed(2)}`);
       return;
     }
 
@@ -44,13 +45,13 @@ export class SimulationEngine {
 
     if (this.hasReachedTakeProfit(lastPrice)) {
       this.isActive = false;
-      window.alert(`Trade target reached at ${lastPrice.toFixed(2)}`);
+      this.onAlert?.(`Trade target reached at ${lastPrice.toFixed(2)}`);
       return;
     }
 
     if (this.hasReachedStopLoss(lastPrice)) {
       this.isActive = false;
-      window.alert(`Trade stopped out at ${lastPrice.toFixed(2)}`);
+      this.onAlert?.(`Trade stopped out at ${lastPrice.toFixed(2)}`);
     }
   }
 

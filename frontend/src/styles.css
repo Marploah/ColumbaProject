@@ -412,3 +412,32 @@ textarea {
     min-height: 520px;
   }
 }
+
+.toast-stack {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 9999;
+  pointer-events: none;
+}
+
+.toast {
+  background: #1e2530;
+  border: 1px solid #2a3344;
+  border-left: 3px solid #f0b429;
+  color: #d7dde5;
+  padding: 10px 16px;
+  border-radius: 6px;
+  font-size: 13px;
+  max-width: 320px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  animation: toast-in 0.2s ease;
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}

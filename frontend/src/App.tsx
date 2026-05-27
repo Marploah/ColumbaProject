@@ -17,6 +17,12 @@ interface ChatMessage {
 
 const apiBase = 'http://127.0.0.1:8080';
 
+function formatTradePlan(plan: TradePlanPayload & { thesis?: string }): string {
+  const fmt = (n: number) => n.toLocaleString(undefined, { maximumFractionDigits: 4 });
+  const levels = `Entry ${fmt(plan.entry_price)} · TP ${fmt(plan.take_profit)} · SL ${fmt(plan.stop_loss)}`;
+  return plan.thesis ? `${plan.thesis}\n\n${levels}` : levels;
+}
+
 const systemPrompt: ChatMessage = {
   role: 'system',
   content:
@@ -42,10 +48,9 @@ export default function App() {
   ]);
   const [selectedInterval, setSelectedInterval] = useState('1m');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [toasts, setToasts] = useState<{ id: number; text: string }[]>([]);
+  const toastIdRef = useRef(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [openaiApiKey, setOpenaiApiKey] = useState(
-    () => localStorage.getItem('columba_openai_api_key') ?? '',
-  );
   const [ollamaUrl, setOllamaUrl] = useState(
     () => localStorage.getItem('columba_ollama_url') ?? 'http://localhost:11434/v1',
   );
@@ -60,6 +65,14 @@ export default function App() {
     }
   });
   const indicatorConfigRef = useRef(indicatorConfig);
+
+  const addToast = useRef((text: string) => {
+    const id = ++toastIdRef.current;
+    setToasts((prev) => [...prev, { id, text }]);
+    setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 4000);
+  }).current;
+
+  simulationRef.current.onAlert = addToast;
   const [emaRawInput, setEmaRawInput] = useState(indicatorConfig.emas.join(', '));
 
   useEffect(() => {
@@ -185,7 +198,6 @@ export default function App() {
   }, [snapshot]);
 
   function saveSettings() {
-    localStorage.setItem('columba_openai_api_key', openaiApiKey);
     localStorage.setItem('columba_ollama_url', ollamaUrl);
     localStorage.setItem('columba_indicators', JSON.stringify(indicatorConfig));
     chartManagerRef.current?.setIndicatorConfig(indicatorConfig);
@@ -211,8 +223,7 @@ export default function App() {
 
     try {
       const body: Record<string, unknown> = { messages: nextMessages };
-      if (openaiApiKey) body.openai_api_key = openaiApiKey;
-      else if (ollamaUrl) body.ollama_url = ollamaUrl;
+      if (ollamaUrl) body.ollama_url = ollamaUrl;
 
       const response = await fetch(`${apiBase}/api/analyze`, {
         method: 'POST',
@@ -236,7 +247,7 @@ export default function App() {
         ...current,
         {
           role: 'assistant',
-          content: JSON.stringify(payload.target),
+          content: formatTradePlan(payload.target),
         },
       ]);
     } catch (error) {
@@ -381,16 +392,9 @@ export default function App() {
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <h3>Settings</h3>
 
-            <label className="select-label">
-              OpenAI API key
-              <input
-                type="password"
-                value={openaiApiKey}
-                onChange={(e) => setOpenaiApiKey(e.target.value)}
-                placeholder="sk-..."
-                autoComplete="off"
-              />
-            </label>
+            <p className="settings-hint">
+              AI key is read from <code>OPENAI_API_KEY</code> env var on the backend.
+            </p>
 
             <label className="select-label">
               Ollama base URL
@@ -486,6 +490,15 @@ export default function App() {
               </button>
             </div>
           </div>
+        </div>
+      )}
+      {toasts.length > 0 && (
+        <div className="toast-stack">
+          {toasts.map((toast) => (
+            <div key={toast.id} className="toast">
+              {toast.text}
+            </div>
+          ))}
         </div>
       )}
     </main>
