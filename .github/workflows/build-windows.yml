@@ -75,6 +75,12 @@ jobs:
           $url = "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
           curl.exe -L -o src-tauri/resources/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf $url
 
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
+      - name: Install tauri-cli
+        run: cargo binstall tauri-cli@^2 --no-confirm
+
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
