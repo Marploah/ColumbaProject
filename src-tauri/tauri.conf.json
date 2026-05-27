@@ -23,7 +23,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": ["icons/icon.png", "icons/icon_32.png", "icons/icon_128.png", "icons/icon_512.png"],
+    "icon": ["icons/icon.ico", "icons/icon.png", "icons/icon_32.png", "icons/icon_128.png", "icons/icon_512.png"],
     "externalBin": ["binaries/llama-server"],
     "resources": {
       "resources/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf": "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
