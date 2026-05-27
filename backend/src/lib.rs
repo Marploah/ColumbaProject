@@ -46,6 +46,7 @@ struct AppState {
     current_oi: Arc<Mutex<Option<f64>>>,
     snapshot_tx: Arc<broadcast::Sender<String>>,
     oi_is_real: Arc<Mutex<bool>>,
+    current_liquidity_walls: Arc<Mutex<LiquidityWalls>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,6 +106,75 @@ struct OiHistEntry {
 struct OiCurrentResponse {
     #[serde(rename = "openInterest")]
     open_interest: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DepthResponse {
+    bids: Vec<[String; 2]>,
+    asks: Vec<[String; 2]>,
+}
+
+fn find_largest_level(levels: &[[String; 2]]) -> (Option<f64>, Option<f64>) {
+    let best = levels
+        .iter()
+        .filter_map(|[price_str, qty_str]| {
+            let price = price_str.parse::<f64>().ok()?;
+            let qty = qty_str.parse::<f64>().ok()?;
+            Some((price, qty))
+        })
+        .max_by(|(_, q1), (_, q2)| q1.partial_cmp(q2).unwrap_or(std::cmp::Ordering::Equal));
+    match best {
+        Some((price, qty)) => (Some(price), Some(qty)),
+        None => (None, None),
+    }
+}
+
+async fn fetch_liquidity_walls(symbol: &str) -> LiquidityWalls {
+    let url = format!(
+        "https://fapi.binance.com/fapi/v1/depth?symbol={}&limit=500",
+        symbol.to_ascii_uppercase()
+    );
+    let result: reqwest::Result<DepthResponse> = async {
+        reqwest::get(&url)
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+    }
+    .await;
+
+    let data = match result {
+        Ok(d) => d,
+        Err(e) => {
+            warn!("order book fetch failed for {symbol}: {e}");
+            return LiquidityWalls::default();
+        }
+    };
+
+    let (bid_wall_price, bid_wall_size) = find_largest_level(&data.bids);
+    let (ask_wall_price, ask_wall_size) = find_largest_level(&data.asks);
+    LiquidityWalls { bid_wall_price, bid_wall_size, ask_wall_price, ask_wall_size }
+}
+
+async fn poll_liquidity_walls(
+    mut symbol_rx: watch::Receiver<String>,
+    current_walls: Arc<Mutex<LiquidityWalls>>,
+) {
+    let mut symbol = symbol_rx.borrow().clone();
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let walls = fetch_liquidity_walls(&symbol).await;
+                *current_walls.lock().await = walls;
+            }
+            Ok(()) = symbol_rx.changed() => {
+                symbol = symbol_rx.borrow_and_update().clone();
+                *current_walls.lock().await = LiquidityWalls::default();
+            }
+        }
+    }
 }
 
 enum TradeMessage {
@@ -271,20 +341,17 @@ pub async fn run() -> Result<()> {
         }
     };
 
-    let initial_tf_biases = fetch_tf_biases(&symbol).await;
+    let (initial_tf_biases, initial_walls) =
+        tokio::join!(fetch_tf_biases(&symbol), fetch_liquidity_walls(&symbol));
     let tf_biases = Arc::new(Mutex::new(initial_tf_biases.clone()));
     let current_oi: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
     let oi_is_real_arc: Arc<Mutex<bool>> = Arc::new(Mutex::new(seed_oi_is_real));
+    let liquidity_walls_arc: Arc<Mutex<LiquidityWalls>> = Arc::new(Mutex::new(initial_walls.clone()));
 
     let initial_market = build_unified_market_state(
         symbol.to_uppercase(),
         initial_candles,
-        LiquidityWalls {
-            bid_wall_price: None,
-            bid_wall_size: None,
-            ask_wall_price: None,
-            ask_wall_size: None,
-        },
+        initial_walls,
         Some(initial_tf_biases),
         seed_oi_is_real,
     );
@@ -304,9 +371,11 @@ pub async fn run() -> Result<()> {
         current_oi,
         snapshot_tx: Arc::clone(&snapshot_tx),
         oi_is_real: Arc::clone(&oi_is_real_arc),
+        current_liquidity_walls: Arc::clone(&liquidity_walls_arc),
     };
 
     let oi_symbol_rx = symbol_rx.clone();
+    let walls_symbol_rx = symbol_rx.clone();
     tokio::spawn(stream_binance_agg_trades(symbol.clone(), trade_tx, symbol_rx));
     tokio::spawn(process_trade_deltas(
         trade_rx,
@@ -314,9 +383,11 @@ pub async fn run() -> Result<()> {
         Arc::clone(&state.tf_biases),
         Arc::clone(&state.current_oi),
         Arc::clone(&oi_is_real_arc),
+        Arc::clone(&liquidity_walls_arc),
         snapshot_tx,
     ));
     tokio::spawn(poll_open_interest(oi_symbol_rx, Arc::clone(&state.current_oi)));
+    tokio::spawn(poll_liquidity_walls(walls_symbol_rx, Arc::clone(&liquidity_walls_arc)));
 
     let allowed_origins: Vec<HeaderValue> = [
         "http://localhost:5173",
@@ -452,16 +523,13 @@ async fn set_symbol(
     *state.tf_biases.lock().await = tf_biases_val.clone();
     *state.current_oi.lock().await = None;
     *state.oi_is_real.lock().await = oi_is_real;
+    *state.current_liquidity_walls.lock().await = LiquidityWalls::default();
 
+    let walls = state.current_liquidity_walls.lock().await.clone();
     let new_market = build_unified_market_state(
         sym.to_ascii_uppercase(),
         candles.clone(),
-        LiquidityWalls {
-            bid_wall_price: None,
-            bid_wall_size: None,
-            ask_wall_price: None,
-            ask_wall_size: None,
-        },
+        walls,
         Some(tf_biases_val),
         oi_is_real,
     );
@@ -496,15 +564,11 @@ async fn set_interval(
     *state.tf_biases.lock().await = tf_biases_val.clone();
     *state.oi_is_real.lock().await = oi_is_real;
 
+    let walls = state.current_liquidity_walls.lock().await.clone();
     let new_market = build_unified_market_state(
         sym.to_ascii_uppercase(),
         candles.clone(),
-        LiquidityWalls {
-            bid_wall_price: None,
-            bid_wall_size: None,
-            ask_wall_price: None,
-            ask_wall_size: None,
-        },
+        walls,
         Some(tf_biases_val),
         oi_is_real,
     );
@@ -633,6 +697,7 @@ async fn process_trade_deltas(
     tf_biases: Arc<Mutex<TfBiases>>,
     current_oi: Arc<Mutex<Option<f64>>>,
     oi_is_real: Arc<Mutex<bool>>,
+    current_liquidity_walls: Arc<Mutex<LiquidityWalls>>,
     snapshot_tx: Arc<broadcast::Sender<String>>,
 ) {
     let mut cvd = Decimal::ZERO;
@@ -662,15 +727,11 @@ async fn process_trade_deltas(
                 let symbol = market.lock().await.symbol.clone();
                 let biases = tf_biases.lock().await.clone();
                 let oi_real = *oi_is_real.lock().await;
+                let walls = current_liquidity_walls.lock().await.clone();
                 let reset_state = build_unified_market_state(
                     symbol,
                     seeded.clone(),
-                    LiquidityWalls {
-                        bid_wall_price: None,
-                        bid_wall_size: None,
-                        ask_wall_price: None,
-                        ask_wall_size: None,
-                    },
+                    walls,
                     Some(biases),
                     oi_real,
                 );
@@ -739,15 +800,11 @@ async fn process_trade_deltas(
                     let symbol = market.lock().await.symbol.clone();
                     let biases = tf_biases.lock().await.clone();
                     let oi_real = *oi_is_real.lock().await;
+                    let walls = current_liquidity_walls.lock().await.clone();
                     let next_state = build_unified_market_state(
                         symbol,
                         candles.clone(),
-                        LiquidityWalls {
-                            bid_wall_price: None,
-                            bid_wall_size: None,
-                            ask_wall_price: None,
-                            ask_wall_size: None,
-                        },
+                        walls,
                         Some(biases),
                         oi_real,
                     );

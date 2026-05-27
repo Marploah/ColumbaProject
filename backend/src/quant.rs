@@ -18,7 +18,7 @@ pub struct CandleData {
     pub open_interest: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LiquidityWalls {
     pub bid_wall_price: Option<f64>,
     pub bid_wall_size: Option<f64>,
