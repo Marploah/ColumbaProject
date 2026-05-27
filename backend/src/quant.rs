@@ -49,6 +49,8 @@ pub struct UnifiedMarketState {
     pub volatility_upper_limit: Option<f64>,
     pub volatility_lower_limit: Option<f64>,
     pub long_short_indicator: String,
+    /// false when open_interest fields contain quote_volume as proxy (Binance OI fetch failed)
+    pub oi_is_real: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -120,11 +122,32 @@ pub fn compute_cvd_slope(candles: &[CandleData]) -> f64 {
     }
 }
 
+/// Computes a symbol-aware CVD divergence threshold (1 sigma of CVD values converted
+/// to slope units). Prevents the hardcoded ±5.0 from being meaningless on high-volume
+/// symbols (BTC) or never-triggering on low-volume alts.
+pub fn compute_cvd_divergence_threshold(candles: &[CandleData]) -> f64 {
+    let window = candles.len().min(20);
+    if window < 2 {
+        return 5.0;
+    }
+    let slice = &candles[candles.len() - window..];
+    let cvd_vals: Vec<f64> = slice
+        .iter()
+        .map(|c| c.cvd.to_f64().unwrap_or(0.0))
+        .collect();
+    let mean = cvd_vals.iter().sum::<f64>() / cvd_vals.len() as f64;
+    let variance = cvd_vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
+        / cvd_vals.len() as f64;
+    // sigma / window converts CVD magnitude to per-candle slope units; floor at 1.0
+    (variance.sqrt() / window as f64).max(1.0)
+}
+
 pub fn calculate_long_short_indicator(
     price_trend_up: bool,
     cvd_slope: f64,
     oi_change_pct: f64,
     rsi_div: &str,
+    cvd_divergence_threshold: f64,
 ) -> String {
     let rsi_div = rsi_div.to_ascii_lowercase();
 
@@ -146,11 +169,11 @@ pub fn calculate_long_short_indicator(
 
     // CVD/price divergence: smart money flow contradicts price action
     // Price rising but buyers drying up hard = distribution = bearish
-    if price_trend_up && cvd_slope < -5.0 && !rsi_div.contains("bullish") {
+    if price_trend_up && cvd_slope < -cvd_divergence_threshold && !rsi_div.contains("bullish") {
         return "WeakShort".to_string();
     }
     // Price falling but buyers stepping in hard = accumulation = bullish
-    if !price_trend_up && cvd_slope > 5.0 && !rsi_div.contains("bearish") {
+    if !price_trend_up && cvd_slope > cvd_divergence_threshold && !rsi_div.contains("bearish") {
         return "WeakLong".to_string();
     }
 
@@ -340,7 +363,8 @@ pub fn compute_tf_bias(candles: &[CandleData]) -> String {
     let price_trend_up = infer_price_trend(candles);
     let cvd_slope = compute_cvd_slope(candles);
     let oi_change_pct = calculate_open_interest_change_pct(candles);
-    calculate_long_short_indicator(price_trend_up, cvd_slope, oi_change_pct, &rsi_div)
+    let cvd_threshold = compute_cvd_divergence_threshold(candles);
+    calculate_long_short_indicator(price_trend_up, cvd_slope, oi_change_pct, &rsi_div, cvd_threshold)
 }
 
 pub fn build_unified_market_state(
@@ -348,6 +372,7 @@ pub fn build_unified_market_state(
     candles: Vec<CandleData>,
     liquidity_walls: LiquidityWalls,
     tf_biases: Option<TfBiases>,
+    oi_is_real: bool,
 ) -> UnifiedMarketState {
     let last_price = candles
         .last()
@@ -360,8 +385,14 @@ pub fn build_unified_market_state(
     let (volatility_upper_limit, volatility_lower_limit) =
         calculate_volatility_limits(last_price, atr_14);
     let rsi_divergence = detect_rsi_divergence(&candles);
-    let primary_bias =
-        calculate_long_short_indicator(price_trend_up, cvd_slope, oi_change_pct, &rsi_divergence);
+    let cvd_threshold = compute_cvd_divergence_threshold(&candles);
+    let primary_bias = calculate_long_short_indicator(
+        price_trend_up,
+        cvd_slope,
+        oi_change_pct,
+        &rsi_divergence,
+        cvd_threshold,
+    );
 
     let biases = tf_biases.unwrap_or_else(|| TfBiases {
         tf_5m: primary_bias.clone(),
@@ -391,5 +422,6 @@ pub fn build_unified_market_state(
         volatility_upper_limit,
         volatility_lower_limit,
         long_short_indicator: primary_bias,
+        oi_is_real,
     }
 }

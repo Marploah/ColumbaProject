@@ -29,9 +29,10 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use axum::http::{header, HeaderValue, Method};
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use tokio_tungstenite::connect_async;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info, warn};
 
 #[derive(Clone)]
@@ -44,12 +45,12 @@ struct AppState {
     tf_biases: Arc<Mutex<TfBiases>>,
     current_oi: Arc<Mutex<Option<f64>>>,
     snapshot_tx: Arc<broadcast::Sender<String>>,
+    oi_is_real: Arc<Mutex<bool>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AnalyzeRequest {
     messages: Vec<ChatMessage>,
-    openai_api_key: Option<String>,
     ollama_url: Option<String>,
 }
 
@@ -134,7 +135,8 @@ async fn fetch_open_interest_history(symbol: &str, period: &str, limit: u32) -> 
         .collect())
 }
 
-async fn merge_open_interest(candles: &mut Vec<CandleData>, symbol: &str, interval: &str) {
+/// Returns true if real OI data was merged; false if candles retain quote_volume proxy.
+async fn merge_open_interest(candles: &mut Vec<CandleData>, symbol: &str, interval: &str) -> bool {
     let oi_period = match interval {
         "1m" | "3m" | "5m" => "5m",
         "15m" => "15m",
@@ -147,13 +149,13 @@ async fn merge_open_interest(candles: &mut Vec<CandleData>, symbol: &str, interv
     let oi_data = match fetch_open_interest_history(symbol, oi_period, 500).await {
         Ok(data) => data,
         Err(e) => {
-            warn!("failed to fetch OI history for {symbol}: {e:?}");
-            return;
+            warn!("failed to fetch OI history for {symbol}: {e:?}; open_interest will use quote_volume proxy");
+            return false;
         }
     };
 
     if oi_data.is_empty() {
-        return;
+        return false;
     }
 
     for candle in candles.iter_mut() {
@@ -164,12 +166,14 @@ async fn merge_open_interest(candles: &mut Vec<CandleData>, symbol: &str, interv
             candle.open_interest = Some(*oi);
         }
     }
+
+    true
 }
 
-async fn fetch_klines_with_oi(symbol: &str, interval: &str) -> Result<Vec<CandleData>> {
+async fn fetch_klines_with_oi(symbol: &str, interval: &str) -> Result<(Vec<CandleData>, bool)> {
     let mut candles = fetch_recent_klines(symbol, interval).await?;
-    merge_open_interest(&mut candles, symbol, interval).await;
-    Ok(candles)
+    let oi_is_real = merge_open_interest(&mut candles, symbol, interval).await;
+    Ok((candles, oi_is_real))
 }
 
 async fn fetch_tf_biases(symbol: &str) -> TfBiases {
@@ -259,17 +263,18 @@ pub async fn run() -> Result<()> {
         AgentTarget::Cloud(model) => AiBroker::openai(api_key, model),
     };
 
-    let initial_candles = match fetch_klines_with_oi(&symbol, "1m").await {
-        Ok(candles) => candles,
+    let (initial_candles, seed_oi_is_real) = match fetch_klines_with_oi(&symbol, "1m").await {
+        Ok(result) => result,
         Err(err) => {
             warn!("failed to seed recent Binance klines: {err:?}");
-            Vec::new()
+            (Vec::new(), false)
         }
     };
 
     let initial_tf_biases = fetch_tf_biases(&symbol).await;
     let tf_biases = Arc::new(Mutex::new(initial_tf_biases.clone()));
     let current_oi: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
+    let oi_is_real_arc: Arc<Mutex<bool>> = Arc::new(Mutex::new(seed_oi_is_real));
 
     let initial_market = build_unified_market_state(
         symbol.to_uppercase(),
@@ -281,6 +286,7 @@ pub async fn run() -> Result<()> {
             ask_wall_size: None,
         },
         Some(initial_tf_biases),
+        seed_oi_is_real,
     );
 
     let (symbol_tx, symbol_rx) = watch::channel(symbol.clone());
@@ -297,6 +303,7 @@ pub async fn run() -> Result<()> {
         tf_biases,
         current_oi,
         snapshot_tx: Arc::clone(&snapshot_tx),
+        oi_is_real: Arc::clone(&oi_is_real_arc),
     };
 
     let oi_symbol_rx = symbol_rx.clone();
@@ -306,11 +313,25 @@ pub async fn run() -> Result<()> {
         Arc::clone(&state.market),
         Arc::clone(&state.tf_biases),
         Arc::clone(&state.current_oi),
+        Arc::clone(&oi_is_real_arc),
         snapshot_tx,
     ));
     tokio::spawn(poll_open_interest(oi_symbol_rx, Arc::clone(&state.current_oi)));
 
-    let cors = CorsLayer::permissive();
+    let allowed_origins: Vec<HeaderValue> = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "tauri://localhost",
+        "https://tauri.localhost",
+    ]
+    .iter()
+    .filter_map(|o| o.parse().ok())
+    .collect();
+
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::list(allowed_origins))
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([header::CONTENT_TYPE]);
 
     let app = Router::new()
         .route("/api/analyze", post(analyze))
@@ -426,10 +447,11 @@ async fn set_symbol(
     let interval = state.current_interval.lock().await.clone();
     info!("switching active symbol to {} (interval={})", sym.to_ascii_uppercase(), interval);
 
-    let candles = fetch_klines_with_oi(&sym, &interval).await.map_err(internal_error)?;
+    let (candles, oi_is_real) = fetch_klines_with_oi(&sym, &interval).await.map_err(internal_error)?;
     let tf_biases_val = fetch_tf_biases(&sym).await;
     *state.tf_biases.lock().await = tf_biases_val.clone();
     *state.current_oi.lock().await = None;
+    *state.oi_is_real.lock().await = oi_is_real;
 
     let new_market = build_unified_market_state(
         sym.to_ascii_uppercase(),
@@ -441,6 +463,7 @@ async fn set_symbol(
             ask_wall_size: None,
         },
         Some(tf_biases_val),
+        oi_is_real,
     );
     *state.market.lock().await = new_market;
 
@@ -468,9 +491,10 @@ async fn set_interval(
     let sym = state.market.lock().await.symbol.to_ascii_lowercase();
     info!("switching interval to {} for {}", req.interval, sym.to_ascii_uppercase());
 
-    let candles = fetch_klines_with_oi(&sym, &req.interval).await.map_err(internal_error)?;
+    let (candles, oi_is_real) = fetch_klines_with_oi(&sym, &req.interval).await.map_err(internal_error)?;
     let tf_biases_val = fetch_tf_biases(&sym).await;
     *state.tf_biases.lock().await = tf_biases_val.clone();
+    *state.oi_is_real.lock().await = oi_is_real;
 
     let new_market = build_unified_market_state(
         sym.to_ascii_uppercase(),
@@ -482,6 +506,7 @@ async fn set_interval(
             ask_wall_size: None,
         },
         Some(tf_biases_val),
+        oi_is_real,
     );
     *state.market.lock().await = new_market;
     *state.current_interval.lock().await = req.interval;
@@ -501,18 +526,8 @@ async fn analyze(
 ) -> Result<Json<AnalyzeResponse>, (axum::http::StatusCode, String)> {
     let market = state.market.lock().await.clone();
 
-    let broker = match (request.openai_api_key, request.ollama_url) {
-        (Some(key), _) if key.starts_with("sk-ant-") => {
-            let model = env::var("ANTHROPIC_MODEL")
-                .unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
-            AiBroker::anthropic(key, model)
-        }
-        (Some(key), _) if !key.is_empty() => {
-            let preferred_model =
-                env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
-            AiBroker::openai(key, preferred_model)
-        }
-        (_, Some(url)) if !url.is_empty() => {
+    let broker = match request.ollama_url {
+        Some(url) if !url.is_empty() => {
             let model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "llama3.2:3b".to_string());
             AiBroker::ollama_at(model, url)
         }
@@ -617,6 +632,7 @@ async fn process_trade_deltas(
     market: Arc<Mutex<UnifiedMarketState>>,
     tf_biases: Arc<Mutex<TfBiases>>,
     current_oi: Arc<Mutex<Option<f64>>>,
+    oi_is_real: Arc<Mutex<bool>>,
     snapshot_tx: Arc<broadcast::Sender<String>>,
 ) {
     let mut cvd = Decimal::ZERO;
@@ -645,6 +661,7 @@ async fn process_trade_deltas(
                 active_bucket = seeded.last().map(|c| c.timestamp / new_ms).unwrap_or(0);
                 let symbol = market.lock().await.symbol.clone();
                 let biases = tf_biases.lock().await.clone();
+                let oi_real = *oi_is_real.lock().await;
                 let reset_state = build_unified_market_state(
                     symbol,
                     seeded.clone(),
@@ -655,6 +672,7 @@ async fn process_trade_deltas(
                         ask_wall_size: None,
                     },
                     Some(biases),
+                    oi_real,
                 );
                 if let Ok(json) = serde_json::to_string(&reset_state) {
                     let _ = snapshot_tx.send(json);
@@ -712,28 +730,28 @@ async fn process_trade_deltas(
                     candles.drain(0..drain_to);
                 }
 
-                let symbol = market.lock().await.symbol.clone();
-                let biases = tf_biases.lock().await.clone();
-                let next_state = build_unified_market_state(
-                    symbol,
-                    candles.clone(),
-                    LiquidityWalls {
-                        bid_wall_price: None,
-                        bid_wall_size: None,
-                        ask_wall_price: None,
-                        ask_wall_size: None,
-                    },
-                    Some(biases),
-                );
-
-                *market.lock().await = next_state.clone();
-
                 let should_broadcast = last_broadcast
                     .map(|t| t.elapsed() >= Duration::from_millis(250))
                     .unwrap_or(true);
 
                 if should_broadcast {
                     last_broadcast = Some(Instant::now());
+                    let symbol = market.lock().await.symbol.clone();
+                    let biases = tf_biases.lock().await.clone();
+                    let oi_real = *oi_is_real.lock().await;
+                    let next_state = build_unified_market_state(
+                        symbol,
+                        candles.clone(),
+                        LiquidityWalls {
+                            bid_wall_price: None,
+                            bid_wall_size: None,
+                            ask_wall_price: None,
+                            ask_wall_size: None,
+                        },
+                        Some(biases),
+                        oi_real,
+                    );
+                    *market.lock().await = next_state.clone();
                     if let Ok(json) = serde_json::to_string(&next_state) {
                         let _ = snapshot_tx.send(json);
                     }

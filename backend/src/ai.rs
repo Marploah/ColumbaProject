@@ -273,7 +273,7 @@ pub fn parse_trade_plan(raw: &str) -> Result<TradePlan> {
     let take_profit = get_number(&value, "take_profit")?;
     let stop_loss = get_number(&value, "stop_loss")?;
 
-    Ok(TradePlan {
+    let plan = TradePlan {
         entry_price,
         take_profit,
         stop_loss,
@@ -281,7 +281,37 @@ pub fn parse_trade_plan(raw: &str) -> Result<TradePlan> {
             .get("thesis")
             .and_then(Value::as_str)
             .map(str::to_string),
-    })
+    };
+
+    validate_trade_plan(&plan)?;
+    Ok(plan)
+}
+
+fn validate_trade_plan(plan: &TradePlan) -> Result<()> {
+    if (plan.take_profit - plan.entry_price).abs() < f64::EPSILON {
+        return Err(anyhow!(
+            "take_profit ({}) equals entry_price ({}) — zero-profit plan rejected",
+            plan.take_profit, plan.entry_price
+        ));
+    }
+
+    let is_long = plan.take_profit > plan.entry_price;
+
+    if is_long && plan.stop_loss >= plan.entry_price {
+        return Err(anyhow!(
+            "long trade invalid: stop_loss ({}) must be below entry_price ({})",
+            plan.stop_loss, plan.entry_price
+        ));
+    }
+
+    if !is_long && plan.stop_loss <= plan.entry_price {
+        return Err(anyhow!(
+            "short trade invalid: stop_loss ({}) must be above entry_price ({})",
+            plan.stop_loss, plan.entry_price
+        ));
+    }
+
+    Ok(())
 }
 
 fn get_number(value: &Value, key: &str) -> Result<f64> {
