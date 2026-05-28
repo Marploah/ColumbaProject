@@ -47,6 +47,7 @@ struct AppState {
     snapshot_tx: Arc<broadcast::Sender<String>>,
     oi_is_real: Arc<Mutex<bool>>,
     current_liquidity_walls: Arc<Mutex<LiquidityWalls>>,
+    current_funding_rate: Arc<Mutex<Option<f64>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,6 +110,12 @@ struct OiCurrentResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct PremiumIndexResponse {
+    #[serde(rename = "lastFundingRate")]
+    last_funding_rate: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct DepthResponse {
     bids: Vec<[String; 2]>,
     asks: Vec<[String; 2]>,
@@ -154,6 +161,40 @@ async fn fetch_liquidity_walls(symbol: &str) -> LiquidityWalls {
     let (bid_wall_price, bid_wall_size) = find_largest_level(&data.bids);
     let (ask_wall_price, ask_wall_size) = find_largest_level(&data.asks);
     LiquidityWalls { bid_wall_price, bid_wall_size, ask_wall_price, ask_wall_size }
+}
+
+async fn poll_funding_rate(
+    mut symbol_rx: watch::Receiver<String>,
+    current_funding_rate: Arc<Mutex<Option<f64>>>,
+) {
+    let mut symbol = symbol_rx.borrow().clone();
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let url = format!(
+                    "https://fapi.binance.com/fapi/v1/premiumIndex?symbol={}",
+                    symbol.to_ascii_uppercase()
+                );
+                match reqwest::get(&url).await {
+                    Ok(resp) => match resp.json::<PremiumIndexResponse>().await {
+                        Ok(data) => {
+                            if let Ok(rate) = data.last_funding_rate.parse::<f64>() {
+                                *current_funding_rate.lock().await = Some(rate);
+                            }
+                        }
+                        Err(e) => warn!("failed to parse funding rate for {symbol}: {e}"),
+                    },
+                    Err(e) => warn!("funding rate request failed for {symbol}: {e}"),
+                }
+            }
+            Ok(()) = symbol_rx.changed() => {
+                symbol = symbol_rx.borrow_and_update().clone();
+                *current_funding_rate.lock().await = None;
+            }
+        }
+    }
 }
 
 async fn poll_liquidity_walls(
@@ -347,6 +388,7 @@ pub async fn run() -> Result<()> {
     let current_oi: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
     let oi_is_real_arc: Arc<Mutex<bool>> = Arc::new(Mutex::new(seed_oi_is_real));
     let liquidity_walls_arc: Arc<Mutex<LiquidityWalls>> = Arc::new(Mutex::new(initial_walls.clone()));
+    let funding_rate_arc: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
 
     let initial_market = build_unified_market_state(
         symbol.to_uppercase(),
@@ -354,6 +396,7 @@ pub async fn run() -> Result<()> {
         initial_walls,
         Some(initial_tf_biases),
         seed_oi_is_real,
+        None,
     );
 
     let (symbol_tx, symbol_rx) = watch::channel(symbol.clone());
@@ -372,10 +415,12 @@ pub async fn run() -> Result<()> {
         snapshot_tx: Arc::clone(&snapshot_tx),
         oi_is_real: Arc::clone(&oi_is_real_arc),
         current_liquidity_walls: Arc::clone(&liquidity_walls_arc),
+        current_funding_rate: Arc::clone(&funding_rate_arc),
     };
 
     let oi_symbol_rx = symbol_rx.clone();
     let walls_symbol_rx = symbol_rx.clone();
+    let fr_symbol_rx = symbol_rx.clone();
     tokio::spawn(stream_binance_agg_trades(symbol.clone(), trade_tx, symbol_rx));
     tokio::spawn(process_trade_deltas(
         trade_rx,
@@ -384,10 +429,12 @@ pub async fn run() -> Result<()> {
         Arc::clone(&state.current_oi),
         Arc::clone(&oi_is_real_arc),
         Arc::clone(&liquidity_walls_arc),
+        Arc::clone(&funding_rate_arc),
         snapshot_tx,
     ));
     tokio::spawn(poll_open_interest(oi_symbol_rx, Arc::clone(&state.current_oi)));
     tokio::spawn(poll_liquidity_walls(walls_symbol_rx, Arc::clone(&liquidity_walls_arc)));
+    tokio::spawn(poll_funding_rate(fr_symbol_rx, Arc::clone(&funding_rate_arc)));
 
     let allowed_origins: Vec<HeaderValue> = [
         "http://localhost:5173",
@@ -526,12 +573,14 @@ async fn set_symbol(
     *state.current_liquidity_walls.lock().await = LiquidityWalls::default();
 
     let walls = state.current_liquidity_walls.lock().await.clone();
+    let fr = *state.current_funding_rate.lock().await;
     let new_market = build_unified_market_state(
         sym.to_ascii_uppercase(),
         candles.clone(),
         walls,
         Some(tf_biases_val),
         oi_is_real,
+        fr,
     );
     *state.market.lock().await = new_market;
 
@@ -565,12 +614,14 @@ async fn set_interval(
     *state.oi_is_real.lock().await = oi_is_real;
 
     let walls = state.current_liquidity_walls.lock().await.clone();
+    let fr = *state.current_funding_rate.lock().await;
     let new_market = build_unified_market_state(
         sym.to_ascii_uppercase(),
         candles.clone(),
         walls,
         Some(tf_biases_val),
         oi_is_real,
+        fr,
     );
     *state.market.lock().await = new_market;
     *state.current_interval.lock().await = req.interval;
@@ -698,6 +749,7 @@ async fn process_trade_deltas(
     current_oi: Arc<Mutex<Option<f64>>>,
     oi_is_real: Arc<Mutex<bool>>,
     current_liquidity_walls: Arc<Mutex<LiquidityWalls>>,
+    current_funding_rate: Arc<Mutex<Option<f64>>>,
     snapshot_tx: Arc<broadcast::Sender<String>>,
 ) {
     let mut cvd = Decimal::ZERO;
@@ -728,12 +780,14 @@ async fn process_trade_deltas(
                 let biases = tf_biases.lock().await.clone();
                 let oi_real = *oi_is_real.lock().await;
                 let walls = current_liquidity_walls.lock().await.clone();
+                let fr = *current_funding_rate.lock().await;
                 let reset_state = build_unified_market_state(
                     symbol,
                     seeded.clone(),
                     walls,
                     Some(biases),
                     oi_real,
+                    fr,
                 );
                 if let Ok(json) = serde_json::to_string(&reset_state) {
                     let _ = snapshot_tx.send(json);
@@ -801,12 +855,14 @@ async fn process_trade_deltas(
                     let biases = tf_biases.lock().await.clone();
                     let oi_real = *oi_is_real.lock().await;
                     let walls = current_liquidity_walls.lock().await.clone();
+                    let fr = *current_funding_rate.lock().await;
                     let next_state = build_unified_market_state(
                         symbol,
                         candles.clone(),
                         walls,
                         Some(biases),
                         oi_real,
+                        fr,
                     );
                     *market.lock().await = next_state.clone();
                     if let Ok(json) = serde_json::to_string(&next_state) {

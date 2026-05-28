@@ -51,6 +51,8 @@ pub struct UnifiedMarketState {
     pub long_short_indicator: String,
     /// false when open_interest fields contain quote_volume as proxy (Binance OI fetch failed)
     pub oi_is_real: bool,
+    /// Current 8-hour perpetual funding rate (e.g. 0.0001 = 0.01%). None until first poll.
+    pub funding_rate: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -373,6 +375,7 @@ pub fn build_unified_market_state(
     liquidity_walls: LiquidityWalls,
     tf_biases: Option<TfBiases>,
     oi_is_real: bool,
+    funding_rate: Option<f64>,
 ) -> UnifiedMarketState {
     let last_price = candles
         .last()
@@ -423,5 +426,6 @@ pub fn build_unified_market_state(
         volatility_lower_limit,
         long_short_indicator: primary_bias,
         oi_is_real,
+        funding_rate,
     }
 }
