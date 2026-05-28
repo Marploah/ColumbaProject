@@ -28,6 +28,7 @@ export interface MarketSnapshot {
   atr_14?: number | null;
   volatility_upper_limit?: number | null;
   volatility_lower_limit?: number | null;
+  cvd_seeded?: boolean;
 }
 
 export interface TradePlanPayload {

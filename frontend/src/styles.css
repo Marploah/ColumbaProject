@@ -413,6 +413,15 @@ textarea {
   }
 }
 
+.cvd-warming-banner {
+  background: #1a1f2b;
+  border-bottom: 1px solid #2a3344;
+  border-left: 3px solid #f0b429;
+  color: #9aa5b4;
+  font-size: 12px;
+  padding: 6px 14px;
+}
+
 .toast-stack {
   position: fixed;
   bottom: 24px;

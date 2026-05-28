@@ -349,6 +349,11 @@ export default function App() {
             <Camera size={18} />
           </button>
         </div>
+        {snapshot && !snapshot.cvd_seeded && (
+          <div className="cvd-warming-banner">
+            CVD warming up — signals may be imprecise until first live candle closes
+          </div>
+        )}
         <div className="chart-host" ref={chartHostRef} />
       </section>
 

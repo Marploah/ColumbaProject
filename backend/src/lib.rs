@@ -18,7 +18,7 @@ use futures_util::StreamExt;
 use hardware::{determine_execution_target, AgentTarget};
 use quant::{
     apply_cvd_trade_delta, build_unified_market_state, compute_tf_bias, decimal_from_trade_qty,
-    CandleData, LiquidityWalls, TfBiases, UnifiedMarketState,
+    CandleData, LiquidityWalls, SignalCache, TfBiases, UnifiedMarketState,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -121,6 +121,12 @@ struct DepthResponse {
     asks: Vec<[String; 2]>,
 }
 
+/// Exponential backoff duration for consecutive Binance 429 responses.
+/// 5s → 10s → 20s → 40s → 80s → 160s → 300s (cap)
+fn rate_limit_backoff(consecutive_429s: u32) -> Duration {
+    Duration::from_secs((5_u64 << consecutive_429s.min(6)).min(300))
+}
+
 fn find_largest_level(levels: &[[String; 2]]) -> (Option<f64>, Option<f64>) {
     let best = levels
         .iter()
@@ -136,31 +142,20 @@ fn find_largest_level(levels: &[[String; 2]]) -> (Option<f64>, Option<f64>) {
     }
 }
 
-async fn fetch_liquidity_walls(symbol: &str) -> LiquidityWalls {
+async fn fetch_liquidity_walls(symbol: &str) -> reqwest::Result<LiquidityWalls> {
     let url = format!(
         "https://fapi.binance.com/fapi/v1/depth?symbol={}&limit=500",
         symbol.to_ascii_uppercase()
     );
-    let result: reqwest::Result<DepthResponse> = async {
-        reqwest::get(&url)
-            .await?
-            .error_for_status()?
-            .json()
-            .await
-    }
-    .await;
-
-    let data = match result {
-        Ok(d) => d,
-        Err(e) => {
-            warn!("order book fetch failed for {symbol}: {e}");
-            return LiquidityWalls::default();
-        }
-    };
+    let data: DepthResponse = reqwest::get(&url)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
 
     let (bid_wall_price, bid_wall_size) = find_largest_level(&data.bids);
     let (ask_wall_price, ask_wall_size) = find_largest_level(&data.asks);
-    LiquidityWalls { bid_wall_price, bid_wall_size, ask_wall_price, ask_wall_size }
+    Ok(LiquidityWalls { bid_wall_price, bid_wall_size, ask_wall_price, ask_wall_size })
 }
 
 async fn poll_tf_biases(
@@ -194,6 +189,7 @@ async fn poll_funding_rate(
 ) {
     let mut symbol = symbol_rx.borrow().clone();
     let mut interval = tokio::time::interval(Duration::from_secs(30));
+    let mut consecutive_429: u32 = 0;
 
     loop {
         tokio::select! {
@@ -203,19 +199,29 @@ async fn poll_funding_rate(
                     symbol.to_ascii_uppercase()
                 );
                 match reqwest::get(&url).await {
-                    Ok(resp) => match resp.json::<PremiumIndexResponse>().await {
-                        Ok(data) => {
-                            if let Ok(rate) = data.last_funding_rate.parse::<f64>() {
-                                *current_funding_rate.lock().await = Some(rate);
+                    Ok(resp) if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                        consecutive_429 += 1;
+                        let delay = rate_limit_backoff(consecutive_429);
+                        warn!("Binance rate limit on funding rate poll for {symbol}; backing off {}s", delay.as_secs());
+                        tokio::time::sleep(delay).await;
+                    }
+                    Ok(resp) => {
+                        consecutive_429 = 0;
+                        match resp.json::<PremiumIndexResponse>().await {
+                            Ok(data) => {
+                                if let Ok(rate) = data.last_funding_rate.parse::<f64>() {
+                                    *current_funding_rate.lock().await = Some(rate);
+                                }
                             }
+                            Err(e) => warn!("failed to parse funding rate for {symbol}: {e}"),
                         }
-                        Err(e) => warn!("failed to parse funding rate for {symbol}: {e}"),
-                    },
+                    }
                     Err(e) => warn!("funding rate request failed for {symbol}: {e}"),
                 }
             }
             Ok(()) = symbol_rx.changed() => {
                 symbol = symbol_rx.borrow_and_update().clone();
+                consecutive_429 = 0;
                 *current_funding_rate.lock().await = None;
             }
         }
@@ -228,15 +234,31 @@ async fn poll_liquidity_walls(
 ) {
     let mut symbol = symbol_rx.borrow().clone();
     let mut interval = tokio::time::interval(Duration::from_secs(10));
+    let mut consecutive_429: u32 = 0;
 
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                let walls = fetch_liquidity_walls(&symbol).await;
-                *current_walls.lock().await = walls;
+                match fetch_liquidity_walls(&symbol).await {
+                    Ok(walls) => {
+                        consecutive_429 = 0;
+                        *current_walls.lock().await = walls;
+                    }
+                    Err(e) if e.status() == Some(reqwest::StatusCode::TOO_MANY_REQUESTS) => {
+                        consecutive_429 += 1;
+                        let delay = rate_limit_backoff(consecutive_429);
+                        warn!("Binance rate limit on liquidity walls poll for {symbol}; backing off {}s", delay.as_secs());
+                        tokio::time::sleep(delay).await;
+                    }
+                    Err(e) => {
+                        warn!("order book fetch failed for {symbol}: {e}");
+                        *current_walls.lock().await = LiquidityWalls::default();
+                    }
+                }
             }
             Ok(()) = symbol_rx.changed() => {
                 symbol = symbol_rx.borrow_and_update().clone();
+                consecutive_429 = 0;
                 *current_walls.lock().await = LiquidityWalls::default();
             }
         }
@@ -338,6 +360,7 @@ async fn poll_open_interest(
 ) {
     let mut symbol = symbol_rx.borrow().clone();
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+    let mut consecutive_429: u32 = 0;
 
     loop {
         tokio::select! {
@@ -347,7 +370,14 @@ async fn poll_open_interest(
                     symbol.to_ascii_uppercase()
                 );
                 match reqwest::get(&url).await {
+                    Ok(resp) if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                        consecutive_429 += 1;
+                        let delay = rate_limit_backoff(consecutive_429);
+                        warn!("Binance rate limit on OI poll for {symbol}; backing off {}s", delay.as_secs());
+                        tokio::time::sleep(delay).await;
+                    }
                     Ok(resp) => {
+                        consecutive_429 = 0;
                         match resp.json::<OiCurrentResponse>().await {
                             Ok(data) => {
                                 if let Ok(oi) = data.open_interest.parse::<f64>() {
@@ -362,6 +392,7 @@ async fn poll_open_interest(
             }
             Ok(()) = symbol_rx.changed() => {
                 symbol = symbol_rx.borrow_and_update().clone();
+                consecutive_429 = 0;
                 *current_oi.lock().await = None;
             }
         }
@@ -407,8 +438,9 @@ pub async fn run() -> Result<()> {
         }
     };
 
-    let (initial_tf_biases, initial_walls) =
+    let (initial_tf_biases, initial_walls_result) =
         tokio::join!(fetch_tf_biases(&symbol), fetch_liquidity_walls(&symbol));
+    let initial_walls = initial_walls_result.unwrap_or_default();
     let tf_biases = Arc::new(Mutex::new(initial_tf_biases.clone()));
     let current_oi: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
     let oi_is_real_arc: Arc<Mutex<bool>> = Arc::new(Mutex::new(seed_oi_is_real));
@@ -422,6 +454,8 @@ pub async fn run() -> Result<()> {
         Some(initial_tf_biases),
         seed_oi_is_real,
         None,
+        None,
+        false,
     );
 
     let (symbol_tx, symbol_rx) = watch::channel(symbol.clone());
@@ -608,6 +642,8 @@ async fn set_symbol(
         Some(tf_biases_val),
         oi_is_real,
         fr,
+        None,
+        false,
     );
     *state.market.lock().await = new_market;
 
@@ -649,6 +685,8 @@ async fn set_interval(
         Some(tf_biases_val),
         oi_is_real,
         fr,
+        None,
+        false,
     );
     *state.market.lock().await = new_market;
     *state.current_interval.lock().await = req.interval;
@@ -686,7 +724,7 @@ async fn analyze(
 
 fn internal_error(err: anyhow::Error) -> (axum::http::StatusCode, String) {
     error!("{err:?}");
-    (axum::http::StatusCode::BAD_GATEWAY, err.to_string())
+    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string())
 }
 
 async fn ws_handler(
@@ -784,10 +822,14 @@ async fn process_trade_deltas(
     let mut active_bucket = 0_i64;
     let mut bucket_ms: i64 = 60_000;
     let mut last_broadcast: Option<Instant> = None;
+    let mut signal_cache = SignalCache::default();
+    let mut live_candle_closes: u32 = 0;
 
     while let Some(message) = receiver.recv().await {
         match message {
             TradeMessage::ResetSymbol { candles: seeded } => {
+                signal_cache.invalidate();
+                live_candle_closes = 0;
                 cvd = seeded.last().map(|c| c.cvd).unwrap_or(Decimal::ZERO);
                 active_bucket = seeded.last().map(|c| c.timestamp / bucket_ms).unwrap_or(0);
                 candles = seeded;
@@ -808,6 +850,8 @@ async fn process_trade_deltas(
                 let oi_real = *oi_is_real.lock().await;
                 let walls = current_liquidity_walls.lock().await.clone();
                 let fr = *current_funding_rate.lock().await;
+                signal_cache.invalidate();
+                live_candle_closes = 0;
                 let reset_state = build_unified_market_state(
                     symbol,
                     seeded.clone(),
@@ -815,6 +859,8 @@ async fn process_trade_deltas(
                     Some(biases),
                     oi_real,
                     fr,
+                    None,
+                    false,
                 );
                 if let Ok(json) = serde_json::to_string(&reset_state) {
                     let _ = snapshot_tx.send(json);
@@ -824,14 +870,31 @@ async fn process_trade_deltas(
                 last_broadcast = Some(Instant::now());
             }
             TradeMessage::Trade(trade) => {
-                let price = trade.price.parse::<f64>().unwrap_or_default();
-                let quantity = trade.quantity.parse::<f64>().unwrap_or_default();
+                let price = match trade.price.parse::<f64>() {
+                    Ok(p) if p.is_finite() && p > 0.0 => p,
+                    _ => {
+                        warn!("rejected malformed aggTrade: price={:?}", trade.price);
+                        continue;
+                    }
+                };
+                let quantity = match trade.quantity.parse::<f64>() {
+                    Ok(q) if q.is_finite() && q > 0.0 => q,
+                    _ => {
+                        warn!("rejected malformed aggTrade: quantity={:?}", trade.quantity);
+                        continue;
+                    }
+                };
+                if trade.trade_time <= 0 {
+                    warn!("rejected malformed aggTrade: trade_time={}", trade.trade_time);
+                    continue;
+                }
                 let quantity_decimal = decimal_from_trade_qty(quantity);
                 cvd = apply_cvd_trade_delta(cvd, quantity_decimal, trade.buyer_is_maker);
 
                 let bucket = trade.trade_time / bucket_ms;
                 if active_bucket != bucket {
                     active_bucket = bucket;
+                    live_candle_closes = live_candle_closes.saturating_add(1);
                     let oi = *current_oi.lock().await;
                     candles.push(CandleData {
                         timestamp: bucket * bucket_ms,
@@ -890,6 +953,8 @@ async fn process_trade_deltas(
                         Some(biases),
                         oi_real,
                         fr,
+                        Some(&mut signal_cache),
+                        live_candle_closes >= 1,
                     );
                     *market.lock().await = next_state.clone();
                     if let Ok(json) = serde_json::to_string(&next_state) {

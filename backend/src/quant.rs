@@ -58,6 +58,10 @@ pub struct UnifiedMarketState {
     pub funding_hours_to_settlement: f64,
     /// Volume-weighted average price over the current candle window. None if no volume.
     pub vwap: Option<f64>,
+    /// false until at least one full live-stream candle has closed after startup or symbol/interval
+    /// reset. When false, CVD is seeded from klines (different source than live aggTrade stream)
+    /// and directional signals may be imprecise.
+    pub cvd_seeded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +80,31 @@ impl Default for TfBiases {
             tf_1h: "Neutral".to_string(),
             tf_4h: "Neutral".to_string(),
         }
+    }
+}
+
+/// Cache for O(n) signals that only change on candle close (ATR-14, RSI divergence).
+/// Key: total candle count — a new candle opening increments it, invalidating the cache.
+#[derive(Default)]
+pub struct SignalCache {
+    candle_count: usize,
+    atr_14: Option<f64>,
+    rsi_divergence: String,
+}
+
+impl SignalCache {
+    /// Force recompute on next call (use after symbol/interval reset).
+    pub fn invalidate(&mut self) {
+        self.candle_count = 0;
+    }
+
+    fn get_or_refresh(&mut self, candles: &[CandleData]) -> (Option<f64>, String) {
+        if self.candle_count != candles.len() {
+            self.atr_14 = calculate_atr_14(candles);
+            self.rsi_divergence = detect_rsi_divergence(candles);
+            self.candle_count = candles.len();
+        }
+        (self.atr_14, self.rsi_divergence.clone())
     }
 }
 
@@ -369,9 +398,10 @@ pub fn compute_tf_bias(candles: &[CandleData]) -> String {
     let rsi_div = detect_rsi_divergence(candles);
     let price_trend_up = infer_price_trend(candles);
     let cvd_slope = compute_cvd_slope(candles);
-    let oi_change_pct = calculate_open_interest_change_pct(candles);
     let cvd_threshold = compute_cvd_divergence_threshold(candles);
-    calculate_long_short_indicator(price_trend_up, cvd_slope, oi_change_pct, &rsi_div, cvd_threshold)
+    // TF klines from fetch_recent_klines always carry quote_volume as OI proxy,
+    // never real open interest. Pass 0.0 so OI-gated Strong* signals are disabled.
+    calculate_long_short_indicator(price_trend_up, cvd_slope, 0.0, &rsi_div, cvd_threshold)
 }
 
 /// Hours until the next 8-hour perpetual funding settlement (00:00, 08:00, 16:00 UTC).
@@ -405,6 +435,428 @@ pub fn calculate_vwap(candles: &[CandleData]) -> Option<f64> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal::prelude::FromPrimitive;
+
+    fn make_candle(close: f64, cvd: f64) -> CandleData {
+        CandleData {
+            timestamp: 0,
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume: 1.0,
+            buy_volume: Decimal::ZERO,
+            sell_volume: Decimal::ZERO,
+            cvd: Decimal::from_f64(cvd).unwrap_or(Decimal::ZERO),
+            open_interest: None,
+        }
+    }
+
+    fn make_candle_ohlcv(open: f64, high: f64, low: f64, close: f64, volume: f64) -> CandleData {
+        CandleData {
+            timestamp: 0,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            buy_volume: Decimal::ZERO,
+            sell_volume: Decimal::ZERO,
+            cvd: Decimal::ZERO,
+            open_interest: None,
+        }
+    }
+
+    fn make_candle_with_oi(close: f64, oi: f64) -> CandleData {
+        let mut c = make_candle(close, 0.0);
+        c.open_interest = Some(oi);
+        c
+    }
+
+    // ── CVD accumulation ────────────────────────────────────────────────────────
+
+    #[test]
+    fn cvd_taker_buy_increases_cvd() {
+        let result = apply_cvd_trade_delta(
+            Decimal::ZERO,
+            Decimal::from_f64(1.5).unwrap(),
+            false, // buyer_is_maker=false → taker buy
+        );
+        assert_eq!(result, Decimal::from_f64(1.5).unwrap());
+    }
+
+    #[test]
+    fn cvd_taker_sell_decreases_cvd() {
+        let result = apply_cvd_trade_delta(
+            Decimal::from_f64(10.0).unwrap(),
+            Decimal::from_f64(3.0).unwrap(),
+            true, // buyer_is_maker=true → taker sell
+        );
+        assert_eq!(result, Decimal::from_f64(7.0).unwrap());
+    }
+
+    #[test]
+    fn cvd_accumulates_correctly_across_trades() {
+        // buy 5, sell 2, buy 3 → net +6
+        let mut cvd = Decimal::ZERO;
+        cvd = apply_cvd_trade_delta(cvd, Decimal::from_f64(5.0).unwrap(), false);
+        cvd = apply_cvd_trade_delta(cvd, Decimal::from_f64(2.0).unwrap(), true);
+        cvd = apply_cvd_trade_delta(cvd, Decimal::from_f64(3.0).unwrap(), false);
+        assert_eq!(cvd, Decimal::from_f64(6.0).unwrap());
+    }
+
+    #[test]
+    fn decimal_from_trade_qty_nan_returns_zero() {
+        assert_eq!(decimal_from_trade_qty(f64::NAN), Decimal::ZERO);
+    }
+
+    // ── CVD slope (linear regression) ───────────────────────────────────────────
+
+    #[test]
+    fn cvd_slope_empty_returns_zero() {
+        assert_eq!(compute_cvd_slope(&[]), 0.0);
+    }
+
+    #[test]
+    fn cvd_slope_single_candle_returns_zero() {
+        assert_eq!(compute_cvd_slope(&[make_candle(100.0, 5.0)]), 0.0);
+    }
+
+    #[test]
+    fn cvd_slope_flat_returns_zero() {
+        let candles: Vec<CandleData> = (0..10).map(|_| make_candle(100.0, 5.0)).collect();
+        let slope = compute_cvd_slope(&candles);
+        assert!(slope.abs() < 1e-9, "flat CVD should yield slope≈0, got {slope}");
+    }
+
+    #[test]
+    fn cvd_slope_linearly_increasing_returns_one() {
+        // CVD=[0,1,2,...,9] → OLS slope=1.0
+        let candles: Vec<CandleData> = (0..10).map(|i| make_candle(100.0, i as f64)).collect();
+        let slope = compute_cvd_slope(&candles);
+        assert!((slope - 1.0).abs() < 1e-9, "expected slope 1.0, got {slope}");
+    }
+
+    #[test]
+    fn cvd_slope_linearly_decreasing_returns_negative_one() {
+        // CVD=[9,8,...,0] → OLS slope=-1.0
+        let candles: Vec<CandleData> = (0..10)
+            .map(|i| make_candle(100.0, (9 - i) as f64))
+            .collect();
+        let slope = compute_cvd_slope(&candles);
+        assert!((slope + 1.0).abs() < 1e-9, "expected slope -1.0, got {slope}");
+    }
+
+    #[test]
+    fn cvd_slope_uses_last_20_candles() {
+        // 25 candles: first 5 CVD=0 (noise), last 20 CVD=[0..19] (slope=1.0)
+        let mut candles: Vec<CandleData> = (0..5).map(|_| make_candle(100.0, 0.0)).collect();
+        candles.extend((0..20).map(|i| make_candle(100.0, i as f64)));
+        let slope = compute_cvd_slope(&candles);
+        assert!((slope - 1.0).abs() < 1e-9, "expected slope 1.0 from last-20 window, got {slope}");
+    }
+
+    // ── CVD divergence threshold ─────────────────────────────────────────────────
+
+    #[test]
+    fn cvd_threshold_flat_cvd_floors_at_one() {
+        let candles: Vec<CandleData> = (0..20).map(|_| make_candle(100.0, 5.0)).collect();
+        let t = compute_cvd_divergence_threshold(&candles);
+        assert!((t - 1.0).abs() < 1e-9, "zero-variance CVD should floor at 1.0, got {t}");
+    }
+
+    #[test]
+    fn cvd_threshold_too_few_candles_returns_default() {
+        assert_eq!(compute_cvd_divergence_threshold(&[]), 5.0);
+        assert_eq!(compute_cvd_divergence_threshold(&[make_candle(100.0, 0.0)]), 5.0);
+    }
+
+    // ── Long/short indicator ─────────────────────────────────────────────────────
+
+    #[test]
+    fn long_short_strong_long() {
+        assert_eq!(
+            calculate_long_short_indicator(true, 1.0, 1.0, "none", 5.0),
+            "StrongLong"
+        );
+    }
+
+    #[test]
+    fn long_short_strong_short() {
+        assert_eq!(
+            calculate_long_short_indicator(false, -1.0, 1.0, "none", 5.0),
+            "StrongShort"
+        );
+    }
+
+    #[test]
+    fn long_short_weak_long_without_oi_expansion() {
+        // price up + CVD up, OI not expanding → WeakLong not StrongLong
+        assert_eq!(
+            calculate_long_short_indicator(true, 1.0, 0.0, "none", 5.0),
+            "WeakLong"
+        );
+    }
+
+    #[test]
+    fn long_short_weak_short_without_oi_expansion() {
+        assert_eq!(
+            calculate_long_short_indicator(false, -1.0, 0.0, "none", 5.0),
+            "WeakShort"
+        );
+    }
+
+    #[test]
+    fn long_short_distribution_divergence_yields_weak_short() {
+        // price rising but CVD strongly negative = distribution
+        assert_eq!(
+            calculate_long_short_indicator(true, -6.0, 0.0, "none", 5.0),
+            "WeakShort"
+        );
+    }
+
+    #[test]
+    fn long_short_accumulation_divergence_yields_weak_long() {
+        // price falling but CVD strongly positive = accumulation
+        assert_eq!(
+            calculate_long_short_indicator(false, 6.0, 0.0, "none", 5.0),
+            "WeakLong"
+        );
+    }
+
+    #[test]
+    fn long_short_rsi_bullish_fallback() {
+        assert_eq!(
+            calculate_long_short_indicator(false, 0.0, 0.0, "bullish", 5.0),
+            "WeakLong"
+        );
+    }
+
+    #[test]
+    fn long_short_rsi_bearish_fallback() {
+        assert_eq!(
+            calculate_long_short_indicator(true, 0.0, 0.0, "bearish", 5.0),
+            "WeakShort"
+        );
+    }
+
+    #[test]
+    fn long_short_neutral_when_no_signal() {
+        // price up, CVD slightly negative (below threshold), no RSI divergence
+        assert_eq!(
+            calculate_long_short_indicator(true, -1.0, 0.0, "none", 5.0),
+            "Neutral"
+        );
+    }
+
+    #[test]
+    fn long_short_bearish_rsi_blocks_weak_long() {
+        // price up + CVD up, but bearish RSI divergence blocks WeakLong → WeakShort via RSI fallback
+        assert_eq!(
+            calculate_long_short_indicator(true, 1.0, 0.0, "bearish", 5.0),
+            "WeakShort"
+        );
+    }
+
+    // ── ATR-14 ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn atr_14_none_with_fewer_than_14_candles() {
+        let candles: Vec<CandleData> = (0..13)
+            .map(|_| make_candle_ohlcv(100.0, 110.0, 90.0, 100.0, 1.0))
+            .collect();
+        assert!(calculate_atr_14(&candles).is_none());
+    }
+
+    #[test]
+    fn atr_14_some_with_sufficient_candles() {
+        let candles: Vec<CandleData> = (0..20)
+            .map(|i| make_candle_ohlcv(100.0 + i as f64, 110.0 + i as f64, 90.0 + i as f64, 100.0 + i as f64, 1.0))
+            .collect();
+        let atr = calculate_atr_14(&candles);
+        assert!(atr.is_some(), "expected Some(ATR) with 20 candles");
+        assert!(atr.unwrap() > 0.0, "ATR should be positive for candles with range");
+    }
+
+    #[test]
+    fn atr_14_constant_range_converges_to_true_range() {
+        // high=110, low=90, close=100 → TR=20 every candle; after 30 candles ATR≈20
+        let candles: Vec<CandleData> = (0..30)
+            .map(|_| make_candle_ohlcv(100.0, 110.0, 90.0, 100.0, 1.0))
+            .collect();
+        let atr = calculate_atr_14(&candles).expect("should compute ATR with 30 candles");
+        assert!(
+            (atr - 20.0).abs() < 1.0,
+            "ATR should converge to ~20 for constant TR=20, got {atr}"
+        );
+    }
+
+    // ── Volatility limits ────────────────────────────────────────────────────────
+
+    #[test]
+    fn volatility_limits_correct_with_valid_atr() {
+        let (upper, lower) = calculate_volatility_limits(1000.0, Some(100.0));
+        assert_eq!(upper, Some(1150.0)); // 1000 + 1.5×100
+        assert_eq!(lower, Some(850.0));  // 1000 − 1.5×100
+    }
+
+    #[test]
+    fn volatility_limits_none_when_atr_none() {
+        let (upper, lower) = calculate_volatility_limits(1000.0, None);
+        assert!(upper.is_none() && lower.is_none());
+    }
+
+    #[test]
+    fn volatility_limits_none_when_atr_zero() {
+        let (upper, lower) = calculate_volatility_limits(1000.0, Some(0.0));
+        assert!(upper.is_none() && lower.is_none());
+    }
+
+    // ── Price trend ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn price_trend_up_when_last_close_higher() {
+        let candles: Vec<CandleData> = [1.0, 2.0, 3.0, 4.0, 5.0]
+            .iter()
+            .map(|&c| make_candle(c, 0.0))
+            .collect();
+        assert!(infer_price_trend(&candles));
+    }
+
+    #[test]
+    fn price_trend_down_when_last_close_lower() {
+        let candles: Vec<CandleData> = [5.0, 4.0, 3.0, 2.0, 1.0]
+            .iter()
+            .map(|&c| make_candle(c, 0.0))
+            .collect();
+        assert!(!infer_price_trend(&candles));
+    }
+
+    #[test]
+    fn price_trend_flat_returns_true() {
+        let candles = vec![make_candle(100.0, 0.0), make_candle(100.0, 0.0)];
+        assert!(infer_price_trend(&candles)); // last >= first
+    }
+
+    #[test]
+    fn price_trend_single_candle_returns_false() {
+        assert!(!infer_price_trend(&[make_candle(100.0, 0.0)]));
+    }
+
+    // ── Open interest change % ───────────────────────────────────────────────────
+
+    #[test]
+    fn oi_change_pct_increasing() {
+        let candles = vec![
+            make_candle_with_oi(100.0, 1000.0),
+            make_candle_with_oi(100.0, 1100.0),
+        ];
+        let pct = calculate_open_interest_change_pct(&candles);
+        assert!((pct - 10.0).abs() < 1e-9, "expected 10%, got {pct}");
+    }
+
+    #[test]
+    fn oi_change_pct_decreasing() {
+        let candles = vec![
+            make_candle_with_oi(100.0, 1000.0),
+            make_candle_with_oi(100.0, 900.0),
+        ];
+        let pct = calculate_open_interest_change_pct(&candles);
+        assert!((pct + 10.0).abs() < 1e-9, "expected -10%, got {pct}");
+    }
+
+    #[test]
+    fn oi_change_pct_no_oi_data_returns_zero() {
+        let candles = vec![make_candle(100.0, 0.0), make_candle(100.0, 0.0)];
+        assert_eq!(calculate_open_interest_change_pct(&candles), 0.0);
+    }
+
+    #[test]
+    fn oi_change_pct_single_value_returns_zero() {
+        assert_eq!(
+            calculate_open_interest_change_pct(&[make_candle_with_oi(100.0, 1000.0)]),
+            0.0
+        );
+    }
+
+    // ── oi_is_real gating in build_unified_market_state ──────────────────────────
+
+    #[test]
+    fn proxy_oi_does_not_produce_strong_long() {
+        // Without real OI, even expanding quote_volume should not yield StrongLong
+        let mut candles: Vec<CandleData> = (0..20)
+            .map(|i| {
+                let mut c = make_candle_ohlcv(
+                    100.0 + i as f64, 101.0 + i as f64,
+                    99.0 + i as f64,  100.0 + i as f64, 1.0
+                );
+                c.cvd = Decimal::from_f64(i as f64).unwrap(); // rising CVD
+                c.open_interest = Some(1000.0 + i as f64 * 10.0); // expanding OI proxy
+                c
+            })
+            .collect();
+        // Give candles a rising CVD trend so without oi_is_real=false this would be StrongLong
+        let oi_change_pct = calculate_open_interest_change_pct(&candles);
+        assert!(oi_change_pct > 0.5, "test setup: OI proxy should appear expanding");
+
+        let state = build_unified_market_state(
+            "BTCUSDT".to_string(),
+            candles,
+            LiquidityWalls::default(),
+            None,
+            false, // oi_is_real = false
+            None,
+            None,
+            false,
+        );
+        assert_ne!(
+            state.long_short_indicator, "StrongLong",
+            "proxy OI should not produce StrongLong, got {}",
+            state.long_short_indicator
+        );
+        assert_ne!(
+            state.long_short_indicator, "StrongShort",
+            "proxy OI should not produce StrongShort, got {}",
+            state.long_short_indicator
+        );
+    }
+
+    // ── VWAP ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn vwap_single_candle_equals_typical_price() {
+        // typical = (120 + 80 + 100) / 3 = 100
+        let c = make_candle_ohlcv(100.0, 120.0, 80.0, 100.0, 10.0);
+        let vwap = calculate_vwap(&[c]).expect("should compute VWAP");
+        assert!((vwap - 100.0).abs() < 1e-9, "expected VWAP=100, got {vwap}");
+    }
+
+    #[test]
+    fn vwap_weighted_by_volume() {
+        // C1: typical=100, vol=1 → pv=100
+        // C2: typical=200, vol=3 → pv=600
+        // VWAP = 700/4 = 175
+        let c1 = make_candle_ohlcv(100.0, 100.0, 100.0, 100.0, 1.0);
+        let c2 = make_candle_ohlcv(200.0, 200.0, 200.0, 200.0, 3.0);
+        let vwap = calculate_vwap(&[c1, c2]).expect("should compute VWAP");
+        assert!((vwap - 175.0).abs() < 1e-9, "expected VWAP=175, got {vwap}");
+    }
+
+    #[test]
+    fn vwap_zero_volume_returns_none() {
+        let c = make_candle_ohlcv(100.0, 110.0, 90.0, 100.0, 0.0);
+        assert!(calculate_vwap(&[c]).is_none());
+    }
+
+    #[test]
+    fn vwap_empty_candles_returns_none() {
+        assert!(calculate_vwap(&[]).is_none());
+    }
+}
+
 pub fn build_unified_market_state(
     symbol: String,
     candles: Vec<CandleData>,
@@ -412,6 +864,8 @@ pub fn build_unified_market_state(
     tf_biases: Option<TfBiases>,
     oi_is_real: bool,
     funding_rate: Option<f64>,
+    cache: Option<&mut SignalCache>,
+    cvd_seeded: bool,
 ) -> UnifiedMarketState {
     let last_price = candles
         .last()
@@ -420,17 +874,21 @@ pub fn build_unified_market_state(
     let price_trend_up = infer_price_trend(&candles);
     let cvd_slope = compute_cvd_slope(&candles);
     let oi_change_pct = calculate_open_interest_change_pct(&candles);
-    let atr_14 = calculate_atr_14(&candles);
+    let (atr_14, rsi_divergence) = match cache {
+        Some(c) => c.get_or_refresh(&candles),
+        None => (calculate_atr_14(&candles), detect_rsi_divergence(&candles)),
+    };
     let vwap = calculate_vwap(&candles);
     let funding_hours_to_settlement = hours_to_next_funding_settlement();
     let (volatility_upper_limit, volatility_lower_limit) =
         calculate_volatility_limits(last_price, atr_14);
-    let rsi_divergence = detect_rsi_divergence(&candles);
     let cvd_threshold = compute_cvd_divergence_threshold(&candles);
+    // When OI data is a quote_volume proxy, do not let it gate Strong* signals.
+    let oi_for_signal = if oi_is_real { oi_change_pct } else { 0.0 };
     let primary_bias = calculate_long_short_indicator(
         price_trend_up,
         cvd_slope,
-        oi_change_pct,
+        oi_for_signal,
         &rsi_divergence,
         cvd_threshold,
     );
@@ -467,5 +925,6 @@ pub fn build_unified_market_state(
         funding_rate,
         funding_hours_to_settlement,
         vwap,
+        cvd_seeded,
     }
 }
