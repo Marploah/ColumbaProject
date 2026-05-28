@@ -163,6 +163,31 @@ async fn fetch_liquidity_walls(symbol: &str) -> LiquidityWalls {
     LiquidityWalls { bid_wall_price, bid_wall_size, ask_wall_price, ask_wall_size }
 }
 
+async fn poll_tf_biases(
+    mut symbol_rx: watch::Receiver<String>,
+    tf_biases: Arc<Mutex<TfBiases>>,
+) {
+    let mut symbol = symbol_rx.borrow().clone();
+    // First tick after 5 minutes — startup already seeded the biases.
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(300),
+        Duration::from_secs(300),
+    );
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let fresh = fetch_tf_biases(&symbol).await;
+                *tf_biases.lock().await = fresh;
+            }
+            Ok(()) = symbol_rx.changed() => {
+                symbol = symbol_rx.borrow_and_update().clone();
+                // set_symbol already reseeds tf_biases; just track the new symbol.
+            }
+        }
+    }
+}
+
 async fn poll_funding_rate(
     mut symbol_rx: watch::Receiver<String>,
     current_funding_rate: Arc<Mutex<Option<f64>>>,
@@ -421,6 +446,7 @@ pub async fn run() -> Result<()> {
     let oi_symbol_rx = symbol_rx.clone();
     let walls_symbol_rx = symbol_rx.clone();
     let fr_symbol_rx = symbol_rx.clone();
+    let tf_symbol_rx = symbol_rx.clone();
     tokio::spawn(stream_binance_agg_trades(symbol.clone(), trade_tx, symbol_rx));
     tokio::spawn(process_trade_deltas(
         trade_rx,
@@ -435,6 +461,7 @@ pub async fn run() -> Result<()> {
     tokio::spawn(poll_open_interest(oi_symbol_rx, Arc::clone(&state.current_oi)));
     tokio::spawn(poll_liquidity_walls(walls_symbol_rx, Arc::clone(&liquidity_walls_arc)));
     tokio::spawn(poll_funding_rate(fr_symbol_rx, Arc::clone(&funding_rate_arc)));
+    tokio::spawn(poll_tf_biases(tf_symbol_rx, Arc::clone(&state.tf_biases)));
 
     let allowed_origins: Vec<HeaderValue> = [
         "http://localhost:5173",
