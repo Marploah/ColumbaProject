@@ -53,6 +53,8 @@ pub struct UnifiedMarketState {
     pub oi_is_real: bool,
     /// Current 8-hour perpetual funding rate (e.g. 0.0001 = 0.01%). None until first poll.
     pub funding_rate: Option<f64>,
+    /// Volume-weighted average price over the current candle window. None if no volume.
+    pub vwap: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -369,6 +371,25 @@ pub fn compute_tf_bias(candles: &[CandleData]) -> String {
     calculate_long_short_indicator(price_trend_up, cvd_slope, oi_change_pct, &rsi_div, cvd_threshold)
 }
 
+/// Session VWAP from all candles in the window.
+/// Returns None if total volume is zero.
+pub fn calculate_vwap(candles: &[CandleData]) -> Option<f64> {
+    let mut sum_pv = 0.0_f64;
+    let mut sum_v = 0.0_f64;
+
+    for c in candles {
+        let typical = (c.high + c.low + c.close) / 3.0;
+        sum_pv += typical * c.volume;
+        sum_v += c.volume;
+    }
+
+    if sum_v > 0.0 && sum_pv.is_finite() {
+        Some(sum_pv / sum_v)
+    } else {
+        None
+    }
+}
+
 pub fn build_unified_market_state(
     symbol: String,
     candles: Vec<CandleData>,
@@ -385,6 +406,7 @@ pub fn build_unified_market_state(
     let cvd_slope = compute_cvd_slope(&candles);
     let oi_change_pct = calculate_open_interest_change_pct(&candles);
     let atr_14 = calculate_atr_14(&candles);
+    let vwap = calculate_vwap(&candles);
     let (volatility_upper_limit, volatility_lower_limit) =
         calculate_volatility_limits(last_price, atr_14);
     let rsi_divergence = detect_rsi_divergence(&candles);
@@ -427,5 +449,6 @@ pub fn build_unified_market_state(
         long_short_indicator: primary_bias,
         oi_is_real,
         funding_rate,
+        vwap,
     }
 }
