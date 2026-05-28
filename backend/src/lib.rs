@@ -1,6 +1,7 @@
 mod ai;
 mod hardware;
 mod quant;
+mod trade_log;
 
 use ai::{AiBroker, ChatMessage, TradePlan};
 use anyhow::{Context, Result};
@@ -16,6 +17,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 use hardware::{determine_execution_target, AgentTarget};
+use trade_log::TradeLog;
 use quant::{
     apply_cvd_trade_delta, build_unified_market_state, compute_tf_bias, decimal_from_trade_qty,
     CandleData, LiquidityWalls, SignalCache, TfBiases, UnifiedMarketState,
@@ -48,6 +50,7 @@ struct AppState {
     oi_is_real: Arc<Mutex<bool>>,
     current_liquidity_walls: Arc<Mutex<LiquidityWalls>>,
     current_funding_rate: Arc<Mutex<Option<f64>>>,
+    trade_log: TradeLog,
 }
 
 #[derive(Debug, Deserialize)]
@@ -463,6 +466,16 @@ pub async fn run() -> Result<()> {
     let (snapshot_tx, _) = broadcast::channel::<String>(64);
     let snapshot_tx = Arc::new(snapshot_tx);
 
+    let db_path = env::var("COLUMBA_TRADE_LOG")
+        .unwrap_or_else(|_| "columba_trades.db".to_string());
+    let trade_log = match TradeLog::open(std::path::Path::new(&db_path)) {
+        Ok(log) => log,
+        Err(e) => {
+            warn!("failed to open trade log at {db_path}: {e:?}; plans will not be persisted");
+            TradeLog::open(std::path::Path::new(":memory:")).expect("in-memory db always works")
+        }
+    };
+
     let state = AppState {
         market: Arc::new(Mutex::new(initial_market)),
         ai,
@@ -475,6 +488,7 @@ pub async fn run() -> Result<()> {
         oi_is_real: Arc::clone(&oi_is_real_arc),
         current_liquidity_walls: Arc::clone(&liquidity_walls_arc),
         current_funding_rate: Arc::clone(&funding_rate_arc),
+        trade_log,
     };
 
     let oi_symbol_rx = symbol_rx.clone();
@@ -514,6 +528,7 @@ pub async fn run() -> Result<()> {
 
     let app = Router::new()
         .route("/api/analyze", post(analyze))
+        .route("/api/trades", get(trades))
         .route("/api/snapshot", get(snapshot))
         .route("/api/symbol", post(set_symbol))
         .route("/api/interval", post(set_interval))
@@ -719,7 +734,21 @@ async fn analyze(
         .await
         .map_err(internal_error)?;
 
+    if let Err(e) = state.trade_log.insert(
+        &market.symbol,
+        target.entry_price,
+        target.take_profit,
+        target.stop_loss,
+        target.thesis.as_deref(),
+    ) {
+        warn!("failed to log trade plan: {e:?}");
+    }
+
     Ok(Json(AnalyzeResponse { target }))
+}
+
+async fn trades(State(state): State<AppState>) -> Result<Json<Vec<trade_log::TradeRecord>>, (StatusCode, String)> {
+    state.trade_log.recent(200).map(Json).map_err(internal_error)
 }
 
 fn internal_error(err: anyhow::Error) -> (axum::http::StatusCode, String) {
