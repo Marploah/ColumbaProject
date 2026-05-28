@@ -194,6 +194,110 @@ impl AiBroker {
     }
 }
 
+/// Formats a human-readable, annotated market brief for the LLM.
+/// Avoids dumping the raw candles array (thousands of tokens the LLM cannot use)
+/// and instead provides each signal with units, magnitude context, and data-quality
+/// warnings so the model can reason about them correctly.
+fn format_market_brief(state: &UnifiedMarketState) -> String {
+    let mut lines = vec![
+        format!("=== MARKET STATE: {} ===", state.symbol),
+        format!("Last price: {:.4}", state.last_price),
+    ];
+
+    if let Some(vwap) = state.vwap {
+        let delta = state.last_price - vwap;
+        let pct = delta / vwap * 100.0;
+        lines.push(format!(
+            "VWAP: {:.4} — price is {:.2}% {} VWAP ({})",
+            vwap,
+            pct.abs(),
+            if delta >= 0.0 { "above" } else { "below" },
+            if delta >= 0.0 { "premium to fair value" } else { "discount to fair value" },
+        ));
+    }
+
+    if let Some(atr) = state.atr_14 {
+        let atr_pct = atr / state.last_price * 100.0;
+        let upper = state.volatility_upper_limit.unwrap_or(f64::NAN);
+        let lower = state.volatility_lower_limit.unwrap_or(f64::NAN);
+        lines.push(format!(
+            "ATR-14: {:.4} ({:.2}% of price) | 1.5× ATR band: [{:.4}, {:.4}]",
+            atr, atr_pct, lower, upper,
+        ));
+    }
+
+    let cvd = state.confluence.cvd_slope;
+    lines.push(format!(
+        "CVD slope (20-candle linear regression): {:.4} — {} flow momentum",
+        cvd,
+        if cvd > 0.0 { "bullish (net buying)" } else { "bearish (net selling)" },
+    ));
+
+    let oi_pct = state.confluence.oi_change_pct;
+    let oi_quality = if state.oi_is_real {
+        "real Binance OI"
+    } else {
+        "PROXY DATA (quote-volume) — discount OI signals, do not rely on them for confirmation"
+    };
+    lines.push(format!(
+        "OI change: {:.2}% ({}) — open interest is {}",
+        oi_pct,
+        oi_quality,
+        if oi_pct > 0.5 { "expanding (new positions opening)" }
+        else if oi_pct < -0.5 { "contracting (positions closing)" }
+        else { "flat" },
+    ));
+
+    if let Some(fr) = state.funding_rate {
+        let fr_pct = fr * 100.0;
+        let sentiment = if fr > 0.001 {
+            "longs paying heavy premium — crowded long, elevated squeeze risk"
+        } else if fr > 0.0001 {
+            "mild long bias"
+        } else if fr < -0.001 {
+            "shorts paying heavy premium — crowded short, elevated squeeze risk"
+        } else if fr < -0.0001 {
+            "mild short bias"
+        } else {
+            "neutral"
+        };
+        let h = state.funding_hours_to_settlement;
+        let urgency = if h < 0.5 {
+            "imminent settlement — funding impact is immediate"
+        } else if h < 2.0 {
+            "settlement approaching"
+        } else {
+            "mid-cycle"
+        };
+        lines.push(format!(
+            "Funding rate: {:.4}% ({}) | {:.1}h to settlement ({})",
+            fr_pct, sentiment, h, urgency,
+        ));
+    }
+
+    if let (Some(bp), Some(bs)) = (state.liquidity_walls.bid_wall_price, state.liquidity_walls.bid_wall_size) {
+        lines.push(format!("Bid liquidity wall: {:.4} (size {:.2}) — demand cluster / support", bp, bs));
+    }
+    if let (Some(ap), Some(as_)) = (state.liquidity_walls.ask_wall_price, state.liquidity_walls.ask_wall_size) {
+        lines.push(format!("Ask liquidity wall: {:.4} (size {:.2}) — supply cluster / resistance", ap, as_));
+    }
+
+    let rsi_div = &state.confluence.rsi_divergence;
+    if rsi_div != "none" {
+        lines.push(format!("RSI-14 divergence: {} — potential momentum reversal", rsi_div));
+    }
+
+    lines.push(format!(
+        "Multi-timeframe bias (fetched from real Binance klines): 5m={} | 15m={} | 1h={} | 4h={}",
+        state.confluence.tf_5m,
+        state.confluence.tf_15m,
+        state.confluence.tf_1h,
+        state.confluence.tf_4h,
+    ));
+
+    lines.join("\n")
+}
+
 pub fn prune_context_window(
     mut messages: Vec<ChatMessage>,
     state: &UnifiedMarketState,
@@ -231,10 +335,10 @@ pub fn prune_context_window(
 
     exchanges.reverse();
 
-    let snapshot = serde_json::to_string(state).context("failed to serialize market snapshot")?;
+    let brief = format_market_brief(state);
     let snapshot_message = ChatMessage {
         role: "user".to_string(),
-        content: format!("Fresh UnifiedMarketState JSON snapshot: {snapshot}"),
+        content: format!("Current market data:\n\n{brief}"),
     };
 
     let mut pruned = Vec::with_capacity(exchanges.len() + 3);

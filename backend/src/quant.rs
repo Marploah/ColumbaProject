@@ -1,6 +1,7 @@
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
 use ta::indicators::{AverageTrueRange, RelativeStrengthIndex};
 use ta::{DataItem, Next};
 
@@ -53,6 +54,8 @@ pub struct UnifiedMarketState {
     pub oi_is_real: bool,
     /// Current 8-hour perpetual funding rate (e.g. 0.0001 = 0.01%). None until first poll.
     pub funding_rate: Option<f64>,
+    /// Hours remaining until the next 8-hour funding settlement (00:00, 08:00, 16:00 UTC).
+    pub funding_hours_to_settlement: f64,
     /// Volume-weighted average price over the current candle window. None if no volume.
     pub vwap: Option<f64>,
 }
@@ -371,6 +374,18 @@ pub fn compute_tf_bias(candles: &[CandleData]) -> String {
     calculate_long_short_indicator(price_trend_up, cvd_slope, oi_change_pct, &rsi_div, cvd_threshold)
 }
 
+/// Hours until the next 8-hour perpetual funding settlement (00:00, 08:00, 16:00 UTC).
+pub fn hours_to_next_funding_settlement() -> f64 {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let period_ms: i64 = 8 * 3_600_000;
+    let ms_into_period = now_ms % period_ms;
+    let ms_remaining = period_ms - ms_into_period;
+    ms_remaining as f64 / 3_600_000.0
+}
+
 /// Session VWAP from all candles in the window.
 /// Returns None if total volume is zero.
 pub fn calculate_vwap(candles: &[CandleData]) -> Option<f64> {
@@ -407,6 +422,7 @@ pub fn build_unified_market_state(
     let oi_change_pct = calculate_open_interest_change_pct(&candles);
     let atr_14 = calculate_atr_14(&candles);
     let vwap = calculate_vwap(&candles);
+    let funding_hours_to_settlement = hours_to_next_funding_settlement();
     let (volatility_upper_limit, volatility_lower_limit) =
         calculate_volatility_limits(last_price, atr_14);
     let rsi_divergence = detect_rsi_divergence(&candles);
@@ -449,6 +465,7 @@ pub fn build_unified_market_state(
         long_short_indicator: primary_bias,
         oi_is_real,
         funding_rate,
+        funding_hours_to_settlement,
         vwap,
     }
 }
