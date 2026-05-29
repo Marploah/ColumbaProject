@@ -8,18 +8,31 @@ ColumbaProject is a crypto futures technical analysis dashboard. Rust Axum backe
 
 ## Commands
 
-### Backend
+### Development (recommended — Makefile)
+```bash
+make dev        # backend + frontend in parallel (colored output)
+make app        # frontend + Tauri desktop app in parallel
+make app-build  # tsc build → cargo tauri build (release installer)
+```
+
+### Backend (standalone)
 ```bash
 cd backend && cargo check          # type-check without full build
 cd backend && cargo build          # compile
 cd backend && cargo run            # run (seeds klines then starts Axum on :8080)
 ```
 
-### Frontend
+### Frontend (standalone)
 ```bash
 cd frontend && npm install         # install deps
 cd frontend && npm run dev         # dev server at http://127.0.0.1:5173
 cd frontend && npm run build       # tsc + vite build → dist/
+```
+
+### Tauri desktop app
+```bash
+cd src-tauri && cargo tauri dev    # dev mode (requires frontend dev server already running)
+cd src-tauri && cargo tauri build  # release build
 ```
 
 ## Environment Variables
@@ -32,8 +45,11 @@ cd frontend && npm run build       # tsc + vite build → dist/
 | `OPENAI_MODEL` | `gpt-4o-mini` | Model for OpenAI / Ollama routing |
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-6` | Model used when an Anthropic key is detected |
 | `BIND_ADDR` | `127.0.0.1:8080` | Backend listen address |
+| `COLUMBA_LLAMA_SERVER_URL` | `http://localhost:11434/v1` | Override Ollama endpoint (set automatically by Tauri when bundled llama-server launches on `:8081`) |
+| `COLUMBA_TRADE_LOG` | `columba_trades.db` | SQLite file for persisting trade plans; falls back to `:memory:` if path unwritable |
+| `RUST_LOG` | `columba_backend=info,tower_http=info` | Standard tracing filter; set to `debug` to trace WS frames and polling tasks |
 
-If `OPENAI_API_KEY` is unset and mode resolves to `Cloud`, the backend falls back to `llama3.1:8b` via Ollama at `http://localhost:11434/v1`.
+If `OPENAI_API_KEY` is unset and mode resolves to `Cloud`, the backend falls back to `llama3.2:3b` via Ollama at `http://localhost:11434/v1`.
 If `OPENAI_API_KEY` starts with `sk-ant-`, the backend routes to `api.anthropic.com` using the Anthropic Messages API format.
 
 ## Architecture
@@ -54,10 +70,16 @@ Binance Futures WS   ──▶  Tokio socket task       │
 ```
 
 ### Backend modules (`backend/src/`)
-- **`main.rs`** — Axum server, kline seeding, WebSocket + processor task spawn, routes `/api/snapshot`, `/api/analyze`, `/api/symbol`
-- **`quant.rs`** — `UnifiedMarketState`, `CandleData`, CVD accumulation (via `rust_decimal::Decimal`), CVD slope (linear regression over 20 candles), ATR-14 (`ta` crate)
-- **`ai.rs`** — `AiBroker`, `TradePlan`, chat history pruning (master prompt + last 3 exchanges), market state injection, markdown fence stripping before JSON parse
-- **`hardware.rs`** — `nvidia-smi` VRAM scan, 3 GB safety buffer deduction, `AgentTarget` routing (Local / Cloud)
+The backend compiles as a **library crate** (`columba-backend`). `main.rs` is a thin binary that calls `columba_backend::run()`. The Tauri app (`src-tauri`) also links against the same library.
+
+- **`lib.rs`** — `pub async fn run()`: Axum server, kline seeding, all routes, background task spawning. Routes: `GET /api/snapshot`, `POST /api/analyze`, `GET /api/trades`, `PATCH /api/trades/:id/outcome`, `POST /api/symbol`, `POST /api/interval`, `GET /ws` (WebSocket). Four background polling tasks spawned here, each receiving a `watch::Receiver<String>` to react to symbol changes: `poll_open_interest` (15s), `poll_liquidity_walls` (10s), `poll_funding_rate` (30s), `poll_tf_biases` (5min).
+- **`quant.rs`** — `UnifiedMarketState`, `CandleData`, `LiquidityWalls`, `TfBiases`, `ConfluenceMatrix`. CVD accumulation via `Decimal`, CVD slope (linear regression 20 candles), ATR-14 + RSI (`ta` crate), VWAP over candle window, funding settlement hours calculation, `build_unified_market_state` assembles all signals.
+- **`ai.rs`** — `AiBroker`, `TradePlan`, chat history pruning (master prompt + last 3 exchanges), market state injection, markdown fence stripping before JSON parse.
+- **`hardware.rs`** — `nvidia-smi` VRAM scan, 3 GB safety buffer deduction, `AgentTarget` routing (Local / Cloud).
+- **`trade_log.rs`** — `TradeLog` wraps `rusqlite::Connection` (bundled SQLite) behind `Arc<Mutex<>>`. Schema: `trade_log` table with `id`, `created_at` (Unix ms), `symbol`, `entry_price`, `take_profit`, `stop_loss`, `thesis`, `outcome`. `outcome` column added via `ALTER TABLE` migration for pre-existing databases. `POST /api/analyze` inserts a record and returns its `trade_log_id`; `PATCH /api/trades/:id/outcome` updates it post-trade.
+
+### Tauri desktop app (`src-tauri/`)
+`src-tauri/src/lib.rs` is the Tauri entry point. On startup it: (1) looks for a bundled `llama-server[.exe]` binary next to the executable and a model at `resources/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf`, (2) if found, spawns it on port 8081 and sets `COLUMBA_LLAMA_SERVER_URL`/`COLUMBA_EXECUTION_MODE=Local`, (3) spawns `columba_backend::run()` on the Tauri async runtime. The llama-server process is killed on window close.
 
 ### Frontend modules (`frontend/src/`)
 - **`ChartManager.ts`** — initializes three chart panes (candlestick+ATR, open interest, CVD), tracks `activePriceLines`; **must call `removePriceLine` on all active lines before drawing a new AI trade plan**
@@ -70,5 +92,7 @@ Binance Futures WS   ──▶  Tokio socket task       │
 - WebSocket ingestion stays isolated from Axum handlers via `mpsc`; never perform socket reads inside request paths.
 - `AiBroker` must strip ` ```json ` / ` ``` ` fences before calling `serde_json::from_str`.
 - `ChartManager` must remove all `activePriceLines` before rendering a new trade plan.
-- The open-interest pane currently uses quote-volume as a proxy; a dedicated OI endpoint is not yet integrated.
-- Symbol switching is handled at runtime via `POST /api/symbol`, which reseeds klines and sends a value over a `watch` channel causing the WebSocket task to reconnect.
+- `UnifiedMarketState.oi_is_real` flag: when `false`, `CandleData.open_interest` contains `quote_volume` as proxy (Binance OI fetch failed). Frontend and AI prompt must distinguish these.
+- WS snapshot broadcast is throttled to 250 ms in `process_trade_deltas`; do not remove this guard — it prevents flooding clients on active markets.
+- Symbol and interval switching both send a `TradeMessage::Reset*` to the trade processor so it reseeds its in-memory candle buffer; without this the processor would re-accumulate CVD from zero against a stale buffer.
+- `POST /api/symbol` and `POST /api/interval` both call `build_unified_market_state` synchronously and update `AppState.market` before sending the reset message, so the first WS frame after a reset carries the full seeded history.

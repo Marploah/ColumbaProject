@@ -15,7 +15,8 @@ interface ChatMessage {
   content: string;
 }
 
-const apiBase = 'http://127.0.0.1:8080';
+const apiBase = (import.meta.env.VITE_API_BASE as string | undefined) ?? 'http://127.0.0.1:8080';
+const wsBase = apiBase.replace(/^http/, 'ws');
 
 function formatTradePlan(plan: TradePlanPayload & { thesis?: string }): string {
   const fmt = (n: number) => n.toLocaleString(undefined, { maximumFractionDigits: 4 });
@@ -63,7 +64,10 @@ export default function App() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [toasts, setToasts] = useState<{ id: number; text: string }[]>([]);
   const toastIdRef = useRef(0);
+  const tradeLogIdRef = useRef<number | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [positionSizePct, setPositionSizePct] = useState(1.0);
+  const [leverage, setLeverage] = useState(1);
   const [ollamaUrl, setOllamaUrl] = useState(
     () => localStorage.getItem('columba_ollama_url') ?? 'http://localhost:11434/v1',
   );
@@ -86,6 +90,8 @@ export default function App() {
   }).current;
 
   simulationRef.current.onAlert = addToast;
+  // Outcome persistence is handled server-side by the trade monitor task.
+  // onOutcome is intentionally not wired to avoid double-writing.
   const [emaRawInput, setEmaRawInput] = useState(indicatorConfig.emas.join(', '));
 
   useEffect(() => {
@@ -165,7 +171,7 @@ export default function App() {
 
     function connect() {
       if (!alive) return;
-      ws = new WebSocket(`ws://127.0.0.1:8080/ws`);
+      ws = new WebSocket(`${wsBase}/ws`);
 
       ws.onmessage = (event) => {
         try {
@@ -235,7 +241,11 @@ export default function App() {
     setIsAnalyzing(true);
 
     try {
-      const body: Record<string, unknown> = { messages: nextMessages };
+      const body: Record<string, unknown> = {
+        messages: nextMessages,
+        position_size_pct: positionSizePct,
+        leverage,
+      };
       if (ollamaUrl) body.ollama_url = ollamaUrl;
 
       const response = await fetch(`${apiBase}/api/analyze`, {
@@ -248,8 +258,9 @@ export default function App() {
         throw new Error(await response.text());
       }
 
-      const payload = (await response.json()) as { target: TradePlanPayload & { thesis?: string } };
+      const payload = (await response.json()) as { target: TradePlanPayload & { thesis?: string }; trade_log_id?: number };
       chartManagerRef.current?.drawTradePlan(payload.target);
+      tradeLogIdRef.current = payload.trade_log_id ?? null;
       simulationRef.current.armTrade({
         entryPrice: payload.target.entry_price,
         takeProfit: payload.target.take_profit,
@@ -399,6 +410,30 @@ export default function App() {
             onChange={(event) => setPrompt(event.target.value)}
             placeholder="Request a trade plan from current CVD, OI, ATR, and liquidity context."
           />
+          <div className="position-sizing-row">
+            <label>
+              Risk %
+              <input
+                type="number"
+                min={0.1}
+                max={100}
+                step={0.1}
+                value={positionSizePct}
+                onChange={(e) => setPositionSizePct(parseFloat(e.target.value) || 1)}
+              />
+            </label>
+            <label>
+              Leverage
+              <input
+                type="number"
+                min={1}
+                max={125}
+                step={1}
+                value={leverage}
+                onChange={(e) => setLeverage(parseInt(e.target.value, 10) || 1)}
+              />
+            </label>
+          </div>
           <button disabled={isAnalyzing} type="submit">
             <Send size={17} />
             {isAnalyzing ? 'Analyzing' : 'Send'}

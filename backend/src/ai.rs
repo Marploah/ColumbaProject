@@ -391,6 +391,8 @@ pub fn parse_trade_plan(raw: &str) -> Result<TradePlan> {
     Ok(plan)
 }
 
+const MIN_REWARD_RISK_RATIO: f64 = 1.5;
+
 fn validate_trade_plan(plan: &TradePlan) -> Result<()> {
     if (plan.take_profit - plan.entry_price).abs() < f64::EPSILON {
         return Err(anyhow!(
@@ -412,6 +414,24 @@ fn validate_trade_plan(plan: &TradePlan) -> Result<()> {
         return Err(anyhow!(
             "short trade invalid: stop_loss ({}) must be above entry_price ({})",
             plan.stop_loss, plan.entry_price
+        ));
+    }
+
+    let reward = (plan.take_profit - plan.entry_price).abs();
+    let risk = (plan.entry_price - plan.stop_loss).abs();
+
+    if risk < f64::EPSILON {
+        return Err(anyhow!(
+            "stop_loss ({}) equals entry_price ({}) — zero-risk plan rejected",
+            plan.stop_loss, plan.entry_price
+        ));
+    }
+
+    let rr = reward / risk;
+    if rr < MIN_REWARD_RISK_RATIO {
+        return Err(anyhow!(
+            "R:R {:.2}:1 below minimum {:.1}:1 (reward {:.4} / risk {:.4}) — plan rejected",
+            rr, MIN_REWARD_RISK_RATIO, reward, risk
         ));
     }
 

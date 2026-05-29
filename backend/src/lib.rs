@@ -8,11 +8,11 @@ use anyhow::{Context, Result};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        Path as AxumPath, State,
     },
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{get, patch, post, put},
     Json, Router,
 };
 use futures_util::StreamExt;
@@ -32,14 +32,15 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use axum::http::{header, HeaderValue, Method};
-use tokio::sync::{broadcast, mpsc, watch, Mutex};
+use std::sync::RwLock as StdRwLock;
+use tokio::sync::{broadcast, mpsc, watch, Mutex, RwLock};
 use tokio_tungstenite::connect_async;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info, warn};
 
 #[derive(Clone)]
 struct AppState {
-    market: Arc<Mutex<UnifiedMarketState>>,
+    market: Arc<RwLock<UnifiedMarketState>>,
     ai: AiBroker,
     symbol_tx: Arc<watch::Sender<String>>,
     trade_tx: mpsc::Sender<TradeMessage>,
@@ -47,6 +48,7 @@ struct AppState {
     tf_biases: Arc<Mutex<TfBiases>>,
     current_oi: Arc<Mutex<Option<f64>>>,
     snapshot_tx: Arc<broadcast::Sender<String>>,
+    price_tx: Arc<broadcast::Sender<f64>>,
     oi_is_real: Arc<Mutex<bool>>,
     current_liquidity_walls: Arc<Mutex<LiquidityWalls>>,
     current_funding_rate: Arc<Mutex<Option<f64>>>,
@@ -57,11 +59,19 @@ struct AppState {
 struct AnalyzeRequest {
     messages: Vec<ChatMessage>,
     ollama_url: Option<String>,
+    position_size_pct: Option<f64>,
+    leverage: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
 struct AnalyzeResponse {
     target: TradePlan,
+    trade_log_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetOutcomeRequest {
+    outcome: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,15 +140,32 @@ fn rate_limit_backoff(consecutive_429s: u32) -> Duration {
     Duration::from_secs((5_u64 << consecutive_429s.min(6)).min(300))
 }
 
-fn find_largest_level(levels: &[[String; 2]]) -> (Option<f64>, Option<f64>) {
-    let best = levels
+// A level qualifies as a wall only if its size is >= this multiple of the mean.
+// Filters spoofed outliers that would otherwise always win a simple max() search.
+const WALL_SIGNIFICANCE_MULTIPLIER: f64 = 3.0;
+
+fn find_significant_wall(levels: &[[String; 2]]) -> (Option<f64>, Option<f64>) {
+    let parsed: Vec<(f64, f64)> = levels
         .iter()
         .filter_map(|[price_str, qty_str]| {
             let price = price_str.parse::<f64>().ok()?;
             let qty = qty_str.parse::<f64>().ok()?;
             Some((price, qty))
         })
+        .collect();
+
+    if parsed.is_empty() {
+        return (None, None);
+    }
+
+    let mean_qty = parsed.iter().map(|(_, q)| q).sum::<f64>() / parsed.len() as f64;
+    let threshold = mean_qty * WALL_SIGNIFICANCE_MULTIPLIER;
+
+    let best = parsed
+        .into_iter()
+        .filter(|(_, qty)| *qty >= threshold)
         .max_by(|(_, q1), (_, q2)| q1.partial_cmp(q2).unwrap_or(std::cmp::Ordering::Equal));
+
     match best {
         Some((price, qty)) => (Some(price), Some(qty)),
         None => (None, None),
@@ -156,8 +183,8 @@ async fn fetch_liquidity_walls(symbol: &str) -> reqwest::Result<LiquidityWalls> 
         .json()
         .await?;
 
-    let (bid_wall_price, bid_wall_size) = find_largest_level(&data.bids);
-    let (ask_wall_price, ask_wall_size) = find_largest_level(&data.asks);
+    let (bid_wall_price, bid_wall_size) = find_significant_wall(&data.bids);
+    let (ask_wall_price, ask_wall_size) = find_significant_wall(&data.asks);
     Ok(LiquidityWalls { bid_wall_price, bid_wall_size, ask_wall_price, ask_wall_size })
 }
 
@@ -465,6 +492,8 @@ pub async fn run() -> Result<()> {
     let (trade_tx, trade_rx) = mpsc::channel::<TradeMessage>(4096);
     let (snapshot_tx, _) = broadcast::channel::<String>(64);
     let snapshot_tx = Arc::new(snapshot_tx);
+    let (price_tx, _) = broadcast::channel::<f64>(512);
+    let price_tx = Arc::new(price_tx);
 
     let db_path = env::var("COLUMBA_TRADE_LOG")
         .unwrap_or_else(|_| "columba_trades.db".to_string());
@@ -477,7 +506,7 @@ pub async fn run() -> Result<()> {
     };
 
     let state = AppState {
-        market: Arc::new(Mutex::new(initial_market)),
+        market: Arc::new(RwLock::new(initial_market)),
         ai,
         symbol_tx: Arc::new(symbol_tx),
         trade_tx: trade_tx.clone(),
@@ -485,6 +514,7 @@ pub async fn run() -> Result<()> {
         tf_biases,
         current_oi,
         snapshot_tx: Arc::clone(&snapshot_tx),
+        price_tx: Arc::clone(&price_tx),
         oi_is_real: Arc::clone(&oi_is_real_arc),
         current_liquidity_walls: Arc::clone(&liquidity_walls_arc),
         current_funding_rate: Arc::clone(&funding_rate_arc),
@@ -505,6 +535,7 @@ pub async fn run() -> Result<()> {
         Arc::clone(&liquidity_walls_arc),
         Arc::clone(&funding_rate_arc),
         snapshot_tx,
+        price_tx,
     ));
     tokio::spawn(poll_open_interest(oi_symbol_rx, Arc::clone(&state.current_oi)));
     tokio::spawn(poll_liquidity_walls(walls_symbol_rx, Arc::clone(&liquidity_walls_arc)));
@@ -523,12 +554,14 @@ pub async fn run() -> Result<()> {
 
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::list(allowed_origins))
-        .allow_methods([Method::GET, Method::POST])
+        .allow_methods([Method::GET, Method::POST, Method::PATCH])
         .allow_headers([header::CONTENT_TYPE]);
 
     let app = Router::new()
         .route("/api/analyze", post(analyze))
         .route("/api/trades", get(trades))
+        .route("/api/trades/summary", get(trades_summary))
+        .route("/api/trades/:id/outcome", patch(patch_trade_outcome))
         .route("/api/snapshot", get(snapshot))
         .route("/api/symbol", post(set_symbol))
         .route("/api/interval", post(set_interval))
@@ -630,7 +663,7 @@ fn decimal_from_trade_qty_checked(value: f64) -> Option<Decimal> {
 }
 
 async fn snapshot(State(state): State<AppState>) -> Json<UnifiedMarketState> {
-    Json(state.market.lock().await.clone())
+    Json(state.market.read().await.clone())
 }
 
 async fn set_symbol(
@@ -641,12 +674,18 @@ async fn set_symbol(
     let interval = state.current_interval.lock().await.clone();
     info!("switching active symbol to {} (interval={})", sym.to_ascii_uppercase(), interval);
 
+    // Notify polling tasks immediately so they stop writing stale-symbol data
+    // before we fetch and assemble the new state. Each task clears its value
+    // upon receiving the watch change.
+    state.symbol_tx.send(sym.clone()).ok();
+    *state.current_oi.lock().await = None;
+    *state.current_funding_rate.lock().await = None;
+    *state.current_liquidity_walls.lock().await = LiquidityWalls::default();
+
     let (candles, oi_is_real) = fetch_klines_with_oi(&sym, &interval).await.map_err(internal_error)?;
     let tf_biases_val = fetch_tf_biases(&sym).await;
     *state.tf_biases.lock().await = tf_biases_val.clone();
-    *state.current_oi.lock().await = None;
     *state.oi_is_real.lock().await = oi_is_real;
-    *state.current_liquidity_walls.lock().await = LiquidityWalls::default();
 
     let walls = state.current_liquidity_walls.lock().await.clone();
     let fr = *state.current_funding_rate.lock().await;
@@ -660,7 +699,7 @@ async fn set_symbol(
         None,
         false,
     );
-    *state.market.lock().await = new_market;
+    *state.market.write().await = new_market;
 
     // Seed the trade processor with the fetched candles so it broadcasts a full
     // snapshot immediately instead of starting from scratch on the first live trade.
@@ -669,8 +708,6 @@ async fn set_symbol(
         .send(TradeMessage::ResetSymbol { candles })
         .await
         .map_err(|e| internal_error(anyhow::anyhow!("trade channel closed: {e}")))?;
-
-    state.symbol_tx.send(sym).ok();
 
     Ok(StatusCode::OK)
 }
@@ -683,7 +720,7 @@ async fn set_interval(
         (StatusCode::BAD_REQUEST, format!("unknown interval: {}", req.interval))
     })?;
 
-    let sym = state.market.lock().await.symbol.to_ascii_lowercase();
+    let sym = state.market.read().await.symbol.to_ascii_lowercase();
     info!("switching interval to {} for {}", req.interval, sym.to_ascii_uppercase());
 
     let (candles, oi_is_real) = fetch_klines_with_oi(&sym, &req.interval).await.map_err(internal_error)?;
@@ -703,7 +740,7 @@ async fn set_interval(
         None,
         false,
     );
-    *state.market.lock().await = new_market;
+    *state.market.write().await = new_market;
     *state.current_interval.lock().await = req.interval;
 
     state
@@ -719,7 +756,7 @@ async fn analyze(
     State(state): State<AppState>,
     Json(request): Json<AnalyzeRequest>,
 ) -> Result<Json<AnalyzeResponse>, (axum::http::StatusCode, String)> {
-    let market = state.market.lock().await.clone();
+    let market = state.market.read().await.clone();
 
     let broker = match request.ollama_url {
         Some(url) if !url.is_empty() => {
@@ -734,21 +771,53 @@ async fn analyze(
         .await
         .map_err(internal_error)?;
 
-    if let Err(e) = state.trade_log.insert(
+    let trade_log_id = match state.trade_log.insert(
         &market.symbol,
         target.entry_price,
         target.take_profit,
         target.stop_loss,
         target.thesis.as_deref(),
+        request.position_size_pct,
+        request.leverage,
     ) {
-        warn!("failed to log trade plan: {e:?}");
+        Ok(id) => Some(id),
+        Err(e) => {
+            warn!("failed to log trade plan: {e:?}");
+            None
+        }
+    };
+
+    if let Some(id) = trade_log_id {
+        tokio::spawn(monitor_trade_outcome(
+            state.trade_log.clone(),
+            id,
+            target.entry_price,
+            target.take_profit,
+            target.stop_loss,
+            state.price_tx.subscribe(),
+        ));
     }
 
-    Ok(Json(AnalyzeResponse { target }))
+    Ok(Json(AnalyzeResponse { target, trade_log_id }))
 }
 
 async fn trades(State(state): State<AppState>) -> Result<Json<Vec<trade_log::TradeRecord>>, (StatusCode, String)> {
     state.trade_log.recent(200).map(Json).map_err(internal_error)
+}
+
+async fn trades_summary(State(state): State<AppState>) -> Result<Json<trade_log::TradeSummary>, (StatusCode, String)> {
+    state.trade_log.summary().map(Json).map_err(internal_error)
+}
+
+async fn patch_trade_outcome(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<i64>,
+    Json(body): Json<SetOutcomeRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    state.trade_log
+        .update_outcome(id, &body.outcome)
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(internal_error)
 }
 
 fn internal_error(err: anyhow::Error) -> (axum::http::StatusCode, String) {
@@ -765,7 +834,7 @@ async fn ws_handler(
 
 async fn handle_ws_client(mut socket: WebSocket, state: AppState) {
     // Send current state immediately so the client renders without waiting for the next trade.
-    if let Ok(json) = serde_json::to_string(&*state.market.lock().await) {
+    if let Ok(json) = serde_json::to_string(&*state.market.read().await) {
         let _ = socket.send(Message::Text(json.into())).await;
     }
 
@@ -836,15 +905,73 @@ async fn stream_binance_agg_trades(
     }
 }
 
+async fn monitor_trade_outcome(
+    trade_log: TradeLog,
+    trade_log_id: i64,
+    entry_price: f64,
+    take_profit: f64,
+    stop_loss: f64,
+    mut price_rx: broadcast::Receiver<f64>,
+) {
+    let is_long = take_profit >= entry_price;
+    let mut has_entry = false;
+    let mut ticks_since_entry: u32 = 0;
+    const MIN_TICKS: u32 = 3;
+
+    let timeout = tokio::time::sleep(Duration::from_secs(86_400));
+    tokio::pin!(timeout);
+
+    loop {
+        let price = tokio::select! {
+            _ = &mut timeout => {
+                let _ = trade_log.update_outcome(trade_log_id, "EXPIRED");
+                info!("trade {trade_log_id} monitor timed out after 24h");
+                return;
+            }
+            result = price_rx.recv() => match result {
+                Ok(p) => p,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        };
+
+        if !has_entry {
+            let hit = if is_long { price <= entry_price } else { price >= entry_price };
+            if hit {
+                has_entry = true;
+                ticks_since_entry = 0;
+            }
+            continue;
+        }
+
+        ticks_since_entry += 1;
+        if ticks_since_entry < MIN_TICKS {
+            continue;
+        }
+
+        if (is_long && price >= take_profit) || (!is_long && price <= take_profit) {
+            let _ = trade_log.update_outcome(trade_log_id, "TP_HIT");
+            info!("trade {trade_log_id} TP hit at {price:.2}");
+            return;
+        }
+        if (is_long && price <= stop_loss) || (!is_long && price >= stop_loss) {
+            let _ = trade_log.update_outcome(trade_log_id, "SL_HIT");
+            info!("trade {trade_log_id} SL hit at {price:.2}");
+            return;
+        }
+    }
+}
+
 async fn process_trade_deltas(
     mut receiver: mpsc::Receiver<TradeMessage>,
-    market: Arc<Mutex<UnifiedMarketState>>,
+    market: Arc<RwLock<UnifiedMarketState>>,
     tf_biases: Arc<Mutex<TfBiases>>,
     current_oi: Arc<Mutex<Option<f64>>>,
     oi_is_real: Arc<Mutex<bool>>,
     current_liquidity_walls: Arc<Mutex<LiquidityWalls>>,
     current_funding_rate: Arc<Mutex<Option<f64>>>,
     snapshot_tx: Arc<broadcast::Sender<String>>,
+    price_tx: Arc<broadcast::Sender<f64>>,
 ) {
     let mut cvd = Decimal::ZERO;
     let mut candles: Vec<CandleData> = Vec::new();
@@ -864,7 +991,7 @@ async fn process_trade_deltas(
                 candles = seeded;
                 // Broadcast the market state (already updated by set_symbol) so the
                 // client gets the full seeded history immediately, not just 1 live candle.
-                let current = market.lock().await.clone();
+                let current = market.read().await.clone();
                 if let Ok(json) = serde_json::to_string(&current) {
                     let _ = snapshot_tx.send(json);
                 }
@@ -874,7 +1001,7 @@ async fn process_trade_deltas(
                 bucket_ms = new_ms;
                 cvd = seeded.last().map(|c| c.cvd).unwrap_or(Decimal::ZERO);
                 active_bucket = seeded.last().map(|c| c.timestamp / new_ms).unwrap_or(0);
-                let symbol = market.lock().await.symbol.clone();
+                let symbol = market.read().await.symbol.clone();
                 let biases = tf_biases.lock().await.clone();
                 let oi_real = *oi_is_real.lock().await;
                 let walls = current_liquidity_walls.lock().await.clone();
@@ -894,7 +1021,7 @@ async fn process_trade_deltas(
                 if let Ok(json) = serde_json::to_string(&reset_state) {
                     let _ = snapshot_tx.send(json);
                 }
-                *market.lock().await = reset_state;
+                *market.write().await = reset_state;
                 candles = seeded;
                 last_broadcast = Some(Instant::now());
             }
@@ -917,6 +1044,8 @@ async fn process_trade_deltas(
                     warn!("rejected malformed aggTrade: trade_time={}", trade.trade_time);
                     continue;
                 }
+                // Broadcast raw price to trade monitors before candle logic.
+                let _ = price_tx.send(price);
                 let quantity_decimal = decimal_from_trade_qty(quantity);
                 cvd = apply_cvd_trade_delta(cvd, quantity_decimal, trade.buyer_is_maker);
 
@@ -970,7 +1099,7 @@ async fn process_trade_deltas(
 
                 if should_broadcast {
                     last_broadcast = Some(Instant::now());
-                    let symbol = market.lock().await.symbol.clone();
+                    let symbol = market.read().await.symbol.clone();
                     let biases = tf_biases.lock().await.clone();
                     let oi_real = *oi_is_real.lock().await;
                     let walls = current_liquidity_walls.lock().await.clone();
@@ -985,7 +1114,7 @@ async fn process_trade_deltas(
                         Some(&mut signal_cache),
                         live_candle_closes >= 1,
                     );
-                    *market.lock().await = next_state.clone();
+                    *market.write().await = next_state.clone();
                     if let Ok(json) = serde_json::to_string(&next_state) {
                         let _ = snapshot_tx.send(json);
                     }
