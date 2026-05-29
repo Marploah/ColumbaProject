@@ -1,3 +1,4 @@
+use crate::state::derivatives::LiquidationState;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -62,6 +63,9 @@ pub struct UnifiedMarketState {
     /// reset. When false, CVD is seeded from klines (different source than live aggTrade stream)
     /// and directional signals may be imprecise.
     pub cvd_seeded: bool,
+    /// Rolling liquidation metrics from the Binance !forceOrder@arr stream.
+    /// feed_healthy=false until the stream connects; all USD values are zero until then.
+    pub liquidations: LiquidationState,
 }
 
 #[derive(Debug, Clone)]
@@ -811,6 +815,7 @@ mod tests {
             None,
             None,
             false,
+            crate::state::derivatives::LiquidationState::default(),
         );
         assert_ne!(
             state.long_short_indicator, "StrongLong",
@@ -866,6 +871,7 @@ pub fn build_unified_market_state(
     funding_rate: Option<f64>,
     cache: Option<&mut SignalCache>,
     cvd_seeded: bool,
+    liquidations: LiquidationState,
 ) -> UnifiedMarketState {
     let last_price = candles
         .last()
@@ -926,5 +932,6 @@ pub fn build_unified_market_state(
         funding_hours_to_settlement,
         vwap,
         cvd_seeded,
+        liquidations,
     }
 }

@@ -1,0 +1,368 @@
+use crate::quant::UnifiedMarketState;
+use crate::state::derivatives::LiquidationState;
+
+/// A semantic interpretation of a market signal with confidence and severity.
+#[derive(Debug, Clone)]
+pub struct SemanticSignal {
+    pub label: String,
+    pub confidence: f32,
+    pub explanation: String,
+    pub severity: Option<String>,
+}
+
+impl SemanticSignal {
+    fn unknown(label: &str, reason: &str) -> Self {
+        Self {
+            label: label.to_string(),
+            confidence: 0.2,
+            explanation: reason.to_string(),
+            severity: None,
+        }
+    }
+}
+
+/// All semantic signals derived from a single `UnifiedMarketState` snapshot.
+#[derive(Debug, Clone)]
+pub struct AiSemanticState {
+    pub leverage_state: SemanticSignal,
+    pub volatility_state: SemanticSignal,
+    pub liquidity_state: SemanticSignal,
+    pub orderflow_state: SemanticSignal,
+    pub directional_bias: SemanticSignal,
+    pub liquidation_state: SemanticSignal,
+    /// Cross-signal contradictions detected. Each entry is a human-readable warning.
+    pub contradictions: Vec<String>,
+}
+
+/// Converts raw `UnifiedMarketState` metrics into semantic signals.
+/// Called by `format_market_brief` in ai.rs — not stored on the state struct
+/// to avoid a `quant` → `state::semantic` → `quant` import cycle.
+pub struct SignalInterpreter;
+
+impl SignalInterpreter {
+    pub fn interpret(state: &UnifiedMarketState) -> AiSemanticState {
+        let leverage_state = Self::interpret_leverage(state);
+        let volatility_state = Self::interpret_volatility(state);
+        let liquidity_state = Self::interpret_liquidity(state);
+        let orderflow_state = Self::interpret_orderflow(state);
+        let directional_bias = Self::interpret_directional(state);
+        let liquidation_state = Self::interpret_liquidations(&state.liquidations);
+
+        let contradictions = Self::detect_contradictions(
+            &leverage_state,
+            &orderflow_state,
+            &liquidation_state,
+            state,
+        );
+
+        AiSemanticState {
+            leverage_state,
+            volatility_state,
+            liquidity_state,
+            orderflow_state,
+            directional_bias,
+            liquidation_state,
+            contradictions,
+        }
+    }
+
+    fn interpret_leverage(state: &UnifiedMarketState) -> SemanticSignal {
+        let Some(fr) = state.funding_rate else {
+            return SemanticSignal::unknown("funding unknown", "funding rate not yet available");
+        };
+
+        // Confidence drops when OI data is a proxy (less reliable leverage signal).
+        let confidence: f32 = if state.oi_is_real { 0.9 } else { 0.55 };
+        let fr_pct = fr * 100.0;
+
+        if fr > 0.001 {
+            SemanticSignal {
+                label: "leverage overcrowding — longs".to_string(),
+                confidence,
+                explanation: format!(
+                    "funding {:.4}% — heavy long premium, elevated short squeeze risk",
+                    fr_pct
+                ),
+                severity: Some("high".to_string()),
+            }
+        } else if fr > 0.0003 {
+            SemanticSignal {
+                label: "mild long bias".to_string(),
+                confidence,
+                explanation: format!("funding {:.4}% — moderate long positioning", fr_pct),
+                severity: None,
+            }
+        } else if fr < -0.001 {
+            SemanticSignal {
+                label: "leverage overcrowding — shorts".to_string(),
+                confidence,
+                explanation: format!(
+                    "funding {:.4}% — heavy short premium, elevated long squeeze risk",
+                    fr_pct
+                ),
+                severity: Some("high".to_string()),
+            }
+        } else if fr < -0.0003 {
+            SemanticSignal {
+                label: "mild short bias".to_string(),
+                confidence,
+                explanation: format!("funding {:.4}% — moderate short positioning", fr_pct),
+                severity: None,
+            }
+        } else {
+            SemanticSignal {
+                label: "leverage neutral".to_string(),
+                confidence,
+                explanation: format!("funding {:.4}% — balanced positioning", fr_pct),
+                severity: None,
+            }
+        }
+    }
+
+    fn interpret_volatility(state: &UnifiedMarketState) -> SemanticSignal {
+        let Some(atr) = state.atr_14 else {
+            return SemanticSignal::unknown(
+                "volatility unknown",
+                "insufficient candle history for ATR-14",
+            );
+        };
+
+        let atr_pct = atr / state.last_price * 100.0;
+
+        if atr_pct < 0.08 {
+            SemanticSignal {
+                label: "volatility compression".to_string(),
+                confidence: 0.82,
+                explanation: format!(
+                    "ATR {:.2}% of price — tight range, breakout conditions building",
+                    atr_pct
+                ),
+                severity: None,
+            }
+        } else if atr_pct > 1.0 {
+            SemanticSignal {
+                label: "volatility expansion".to_string(),
+                confidence: 0.85,
+                explanation: format!(
+                    "ATR {:.2}% of price — elevated risk, wide stops required",
+                    atr_pct
+                ),
+                severity: Some("elevated".to_string()),
+            }
+        } else {
+            SemanticSignal {
+                label: "normal volatility".to_string(),
+                confidence: 0.75,
+                explanation: format!("ATR {:.2}% of price", atr_pct),
+                severity: None,
+            }
+        }
+    }
+
+    fn interpret_liquidity(state: &UnifiedMarketState) -> SemanticSignal {
+        let bid = state.liquidity_walls.bid_wall_price;
+        let ask = state.liquidity_walls.ask_wall_price;
+
+        match (bid, ask) {
+            (Some(b), Some(a)) => SemanticSignal {
+                label: "liquidity walls present both sides".to_string(),
+                confidence: 0.75,
+                explanation: format!("bid wall {:.4} | ask wall {:.4}", b, a),
+                severity: None,
+            },
+            (Some(b), None) => SemanticSignal {
+                label: "strong support, no visible resistance".to_string(),
+                confidence: 0.65,
+                explanation: format!("bid wall {:.4}", b),
+                severity: None,
+            },
+            (None, Some(a)) => SemanticSignal {
+                label: "resistance present, support thin".to_string(),
+                confidence: 0.65,
+                explanation: format!("ask wall {:.4}", a),
+                severity: None,
+            },
+            (None, None) => SemanticSignal {
+                label: "liquidity vacuum".to_string(),
+                confidence: 0.6,
+                explanation: "no significant walls on either side".to_string(),
+                severity: Some("caution".to_string()),
+            },
+        }
+    }
+
+    fn interpret_orderflow(state: &UnifiedMarketState) -> SemanticSignal {
+        let cvd = state.confluence.cvd_slope;
+        // CVD from klines is less reliable than live aggTrade accumulation.
+        let confidence: f32 = if state.cvd_seeded { 0.85 } else { 0.5 };
+        let warming = if !state.cvd_seeded { " (CVD warming up)" } else { "" };
+
+        if cvd > 5.0 {
+            SemanticSignal {
+                label: "aggressive buying pressure".to_string(),
+                confidence,
+                explanation: format!("CVD slope {:.2} — strong taker buy dominance{}", cvd, warming),
+                severity: None,
+            }
+        } else if cvd > 0.0 {
+            SemanticSignal {
+                label: "mild buying pressure".to_string(),
+                confidence,
+                explanation: format!("CVD slope {:.2} — moderate net buying{}", cvd, warming),
+                severity: None,
+            }
+        } else if cvd < -5.0 {
+            SemanticSignal {
+                label: "aggressive selling pressure".to_string(),
+                confidence,
+                explanation: format!("CVD slope {:.2} — strong taker sell dominance{}", cvd, warming),
+                severity: None,
+            }
+        } else {
+            SemanticSignal {
+                label: "balanced flow".to_string(),
+                confidence,
+                explanation: format!("CVD slope {:.2} — no dominant side{}", cvd, warming),
+                severity: None,
+            }
+        }
+    }
+
+    fn interpret_directional(state: &UnifiedMarketState) -> SemanticSignal {
+        let bias = &state.long_short_indicator;
+        let confidence: f32 = match bias.as_str() {
+            "StrongLong" | "StrongShort" => 0.9,
+            "WeakLong" | "WeakShort" => 0.65,
+            _ => 0.4,
+        };
+
+        SemanticSignal {
+            label: bias.clone(),
+            confidence,
+            explanation: format!(
+                "{} | MTF: 5m={} 15m={} 1h={} 4h={}",
+                bias,
+                state.confluence.tf_5m,
+                state.confluence.tf_15m,
+                state.confluence.tf_1h,
+                state.confluence.tf_4h,
+            ),
+            severity: None,
+        }
+    }
+
+    fn interpret_liquidations(liq: &LiquidationState) -> SemanticSignal {
+        if !liq.feed_healthy {
+            return SemanticSignal::unknown(
+                "liquidation feed unavailable",
+                "forceOrder stream not connected",
+            );
+        }
+
+        let total_5m = liq.long_5m + liq.short_5m;
+        let confidence: f32 = if total_5m > 0.0 { 0.85 } else { 0.6 };
+
+        if total_5m < 50_000.0 {
+            return SemanticSignal {
+                label: "liquidation activity low".to_string(),
+                confidence,
+                explanation: format!("5m total: ${:.0}K — quiet market", total_5m / 1000.0),
+                severity: None,
+            };
+        }
+
+        if liq.imbalance_ratio > 2.0 {
+            SemanticSignal {
+                label: "trapped longs — cascade active".to_string(),
+                confidence,
+                explanation: format!(
+                    "5m longs ${:.0}K / shorts ${:.0}K liq'd | velocity {:.1}/s",
+                    liq.long_5m / 1000.0,
+                    liq.short_5m / 1000.0,
+                    liq.velocity,
+                ),
+                severity: Some("high".to_string()),
+            }
+        } else if liq.short_5m > 0.0 && liq.imbalance_ratio < 0.5 {
+            SemanticSignal {
+                label: "trapped shorts — squeeze risk".to_string(),
+                confidence,
+                explanation: format!(
+                    "5m shorts ${:.0}K / longs ${:.0}K liq'd | velocity {:.1}/s",
+                    liq.short_5m / 1000.0,
+                    liq.long_5m / 1000.0,
+                    liq.velocity,
+                ),
+                severity: Some("high".to_string()),
+            }
+        } else {
+            SemanticSignal {
+                label: "liquidation cascade active".to_string(),
+                confidence,
+                explanation: format!(
+                    "5m longs ${:.0}K / shorts ${:.0}K | velocity {:.1}/s",
+                    liq.long_5m / 1000.0,
+                    liq.short_5m / 1000.0,
+                    liq.velocity,
+                ),
+                severity: Some("elevated".to_string()),
+            }
+        }
+    }
+
+    fn detect_contradictions(
+        leverage: &SemanticSignal,
+        orderflow: &SemanticSignal,
+        liquidation: &SemanticSignal,
+        state: &UnifiedMarketState,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+
+        // Buying flow into a crowd of longs → late buyers face squeeze.
+        if orderflow.label.contains("buying") && leverage.label.contains("overcrowding — longs") {
+            out.push(
+                "buying pressure into crowded long positioning — late longs face squeeze risk"
+                    .to_string(),
+            );
+        }
+
+        // Selling flow into a crowd of shorts → late sellers face squeeze.
+        if orderflow.label.contains("selling") && leverage.label.contains("overcrowding — shorts") {
+            out.push(
+                "selling pressure into crowded short positioning — late shorts face squeeze risk"
+                    .to_string(),
+            );
+        }
+
+        // Long cascade active but bias is long → bias may flip.
+        if liquidation.label.contains("trapped longs")
+            && (state.long_short_indicator == "StrongLong"
+                || state.long_short_indicator == "WeakLong")
+        {
+            out.push(
+                "directional bias is long but long cascade active — bias may be invalidated"
+                    .to_string(),
+            );
+        }
+
+        // CVD diverging from price action (distribution / accumulation).
+        let cvd = state.confluence.cvd_slope;
+        let is_long_bias = state.long_short_indicator.contains("Long");
+        if is_long_bias && cvd < -1.0 {
+            out.push(
+                "price trending up but CVD negative — potential distribution / smart money exiting"
+                    .to_string(),
+            );
+        } else if !is_long_bias
+            && state.long_short_indicator.contains("Short")
+            && cvd > 1.0
+        {
+            out.push(
+                "price trending down but CVD positive — potential accumulation / smart money entering"
+                    .to_string(),
+            );
+        }
+
+        out
+    }
+}

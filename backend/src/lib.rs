@@ -1,13 +1,16 @@
 mod ai;
 mod hardware;
 pub mod hardware_profiles;
+mod liquidations;
 pub mod model_manager;
 pub mod model_selector;
 mod quant;
+pub mod state;
 mod trade_log;
 
 use ai::{AiBroker, ChatMessage, TradePlan};
 use anyhow::{Context, Result};
+use liquidations::{parse_force_order, LiquidationAggregator};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -62,6 +65,7 @@ struct AppState {
     oi_is_real: Arc<Mutex<bool>>,
     current_liquidity_walls: Arc<Mutex<LiquidityWalls>>,
     current_funding_rate: Arc<Mutex<Option<f64>>>,
+    liquidation_aggregator: Arc<Mutex<LiquidationAggregator>>,
     trade_log: TradeLog,
     monitor_semaphore: Arc<Semaphore>,
 }
@@ -493,6 +497,9 @@ pub async fn run() -> Result<()> {
     let liquidity_walls_arc: Arc<Mutex<LiquidityWalls>> = Arc::new(Mutex::new(initial_walls.clone()));
     let funding_rate_arc: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
 
+    let liquidation_aggregator_arc: Arc<Mutex<LiquidationAggregator>> =
+        Arc::new(Mutex::new(LiquidationAggregator::default()));
+
     let initial_market = build_unified_market_state(
         symbol.to_uppercase(),
         initial_candles,
@@ -502,6 +509,7 @@ pub async fn run() -> Result<()> {
         None,
         None,
         false,
+        liquidation_aggregator_arc.lock().await.snapshot(),
     );
 
     let (symbol_tx, symbol_rx) = watch::channel(symbol.clone());
@@ -534,6 +542,7 @@ pub async fn run() -> Result<()> {
         oi_is_real: Arc::clone(&oi_is_real_arc),
         current_liquidity_walls: Arc::clone(&liquidity_walls_arc),
         current_funding_rate: Arc::clone(&funding_rate_arc),
+        liquidation_aggregator: Arc::clone(&liquidation_aggregator_arc),
         trade_log,
         monitor_semaphore: Arc::new(Semaphore::new(5)),
     };
@@ -552,6 +561,7 @@ pub async fn run() -> Result<()> {
         .await
         .ok();
 
+    let liq_symbol_rx = symbol_rx.clone();
     tokio::spawn(stream_binance_agg_trades(symbol.clone(), trade_tx, symbol_rx));
     tokio::spawn(process_trade_deltas(
         trade_rx,
@@ -561,6 +571,7 @@ pub async fn run() -> Result<()> {
         Arc::clone(&oi_is_real_arc),
         Arc::clone(&liquidity_walls_arc),
         Arc::clone(&funding_rate_arc),
+        Arc::clone(&liquidation_aggregator_arc),
         snapshot_tx,
         price_tx,
     ));
@@ -568,6 +579,7 @@ pub async fn run() -> Result<()> {
     tokio::spawn(poll_liquidity_walls(walls_symbol_rx, Arc::clone(&liquidity_walls_arc)));
     tokio::spawn(poll_funding_rate(fr_symbol_rx, Arc::clone(&funding_rate_arc)));
     tokio::spawn(poll_tf_biases(tf_symbol_rx, Arc::clone(&state.tf_biases)));
+    tokio::spawn(stream_liquidations(liq_symbol_rx, Arc::clone(&liquidation_aggregator_arc)));
 
     let allowed_origins: Vec<HeaderValue> = [
         "http://localhost:5173",
@@ -721,6 +733,7 @@ async fn set_symbol(
 
     let walls = state.current_liquidity_walls.lock().await.clone();
     let fr = *state.current_funding_rate.lock().await;
+    let liq_snap = state.liquidation_aggregator.lock().await.snapshot();
     let new_market = build_unified_market_state(
         sym.to_ascii_uppercase(),
         candles.clone(),
@@ -730,6 +743,7 @@ async fn set_symbol(
         fr,
         None,
         false,
+        liq_snap,
     );
     *state.market.write().await = new_market;
 
@@ -767,6 +781,7 @@ async fn set_interval(
 
     let walls = state.current_liquidity_walls.lock().await.clone();
     let fr = *state.current_funding_rate.lock().await;
+    let liq_snap = state.liquidation_aggregator.lock().await.snapshot();
     let new_market = build_unified_market_state(
         sym.to_ascii_uppercase(),
         candles.clone(),
@@ -776,6 +791,7 @@ async fn set_interval(
         fr,
         None,
         false,
+        liq_snap,
     );
     *state.market.write().await = new_market;
     *state.current_interval.lock().await = req.interval;
@@ -1146,6 +1162,7 @@ async fn process_trade_deltas(
     oi_is_real: Arc<Mutex<bool>>,
     current_liquidity_walls: Arc<Mutex<LiquidityWalls>>,
     current_funding_rate: Arc<Mutex<Option<f64>>>,
+    liquidation_aggregator: Arc<Mutex<LiquidationAggregator>>,
     snapshot_tx: Arc<broadcast::Sender<String>>,
     price_tx: Arc<broadcast::Sender<f64>>,
 ) {
@@ -1184,6 +1201,7 @@ async fn process_trade_deltas(
                 let fr = *current_funding_rate.lock().await;
                 signal_cache.invalidate();
                 live_candle_closes = 0;
+                let liq_snap = liquidation_aggregator.lock().await.snapshot();
                 let reset_state = build_unified_market_state(
                     symbol,
                     seeded.clone(),
@@ -1193,6 +1211,7 @@ async fn process_trade_deltas(
                     fr,
                     None,
                     false,
+                    liq_snap,
                 );
                 if let Ok(json) = serde_json::to_string(&reset_state) {
                     let _ = snapshot_tx.send(json);
@@ -1280,6 +1299,7 @@ async fn process_trade_deltas(
                     let oi_real = *oi_is_real.lock().await;
                     let walls = current_liquidity_walls.lock().await.clone();
                     let fr = *current_funding_rate.lock().await;
+                    let liq_snap = liquidation_aggregator.lock().await.snapshot();
                     let next_state = build_unified_market_state(
                         symbol,
                         candles.clone(),
@@ -1289,6 +1309,7 @@ async fn process_trade_deltas(
                         fr,
                         Some(&mut signal_cache),
                         live_candle_closes >= 1,
+                        liq_snap,
                     );
                     *market.write().await = next_state.clone();
                     if let Ok(json) = serde_json::to_string(&next_state) {
@@ -1297,6 +1318,77 @@ async fn process_trade_deltas(
                 }
             }
         }
+    }
+}
+
+/// Connects to the Binance !forceOrder@arr combined liquidation stream and pushes
+/// parsed events into the shared aggregator. No REST fallback exists for this stream.
+/// On failure, the aggregator is marked unhealthy and the stream retries with
+/// exponential backoff — failure never blocks the core aggTrade pipeline.
+async fn stream_liquidations(
+    symbol_rx: watch::Receiver<String>,
+    aggregator: Arc<Mutex<LiquidationAggregator>>,
+) {
+    let endpoint = "wss://fstream.binance.com/ws/!forceOrder@arr";
+    let mut retry_delay = Duration::from_secs(5);
+
+    loop {
+        let ws_req = match WsRequest::builder()
+            .uri(endpoint)
+            .header("Host", "fstream.binance.com")
+            .header("User-Agent", "columba/1.0")
+            .header("Origin", "https://fstream.binance.com")
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", generate_key())
+            .body(())
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("liquidation stream: failed to build WS request: {e}");
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(300));
+                continue;
+            }
+        };
+
+        match connect_async(ws_req).await {
+            Ok((mut socket, _)) => {
+                info!("liquidation stream connected");
+                retry_delay = Duration::from_secs(5);
+                aggregator.lock().await.mark_healthy();
+
+                loop {
+                    match socket.next().await {
+                        Some(Ok(WsMessage::Text(text))) => {
+                            let active_sym = symbol_rx.borrow().to_ascii_uppercase();
+                            if let Some(event) = parse_force_order(&text, &active_sym) {
+                                aggregator.lock().await.push(event);
+                            }
+                        }
+                        Some(Ok(WsMessage::Ping(p))) => {
+                            let _ = socket.send(WsMessage::Pong(p)).await;
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => {
+                            warn!("liquidation stream error: {e}");
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+
+                aggregator.lock().await.mark_unhealthy();
+                warn!("liquidation stream disconnected");
+            }
+            Err(e) => {
+                warn!("liquidation stream: connect failed: {e}");
+            }
+        }
+
+        tokio::time::sleep(retry_delay).await;
+        retry_delay = (retry_delay * 2).min(Duration::from_secs(300));
     }
 }
 

@@ -1,4 +1,18 @@
 use crate::quant::UnifiedMarketState;
+use crate::state::semantic::SignalInterpreter;
+
+/// GBNF grammar injected into llama.cpp requests to guarantee valid JSON output.
+/// Enforces exact field order (numerics first, thesis last) so the model focuses
+/// on numerical precision before generating the free-text thesis.
+const TRADE_PLAN_GRAMMAR: &str = r#"root  ::= "{" ws fld-entry "," ws fld-tp "," ws fld-sl "," ws fld-thesis ws "}"
+fld-entry  ::= "\"entry_price\""  ws ":" ws number
+fld-tp     ::= "\"take_profit\""  ws ":" ws number
+fld-sl     ::= "\"stop_loss\""    ws ":" ws number
+fld-thesis ::= "\"thesis\""       ws ":" ws string
+number ::= "-"? ( [0-9]+ ( "." [0-9]+ )? )
+string ::= "\"" char* "\""
+char   ::= [^"\\] | "\\" ( ["\\/bfnrt] | "u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] )
+ws     ::= ( " " | "\t" | "\n" | "\r" )*"#;
 use anyhow::{anyhow, Context, Result};
 use async_openai::{config::OpenAIConfig, Client};
 use regex::Regex;
@@ -121,6 +135,7 @@ impl AiBroker {
                 });
                 if matches!(self.provider, Provider::LlamaCpp) {
                     body["chat_template_kwargs"] = json!({ "enable_thinking": false });
+                    body["grammar"] = json!(TRADE_PLAN_GRAMMAR);
                 }
                 body
             })
@@ -296,6 +311,56 @@ fn format_market_brief(state: &UnifiedMarketState) -> String {
         state.confluence.tf_1h,
         state.confluence.tf_4h,
     ));
+
+    // Semantic summary — gated by COLUMBA_SEMANTIC_BRIEF (default on).
+    // Adds compressed interpretations and contradiction warnings without
+    // duplicating the raw metrics already printed above.
+    let semantic_on = std::env::var("COLUMBA_SEMANTIC_BRIEF")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+
+    if semantic_on {
+        let sem = SignalInterpreter::interpret(state);
+
+        // Collect high-confidence signals (≥0.6) that have a severity tag first,
+        // then remaining signals above the floor, sorted by confidence desc.
+        const CONFIDENCE_FLOOR: f32 = 0.6;
+        let signals = [
+            &sem.leverage_state,
+            &sem.volatility_state,
+            &sem.liquidity_state,
+            &sem.orderflow_state,
+            &sem.liquidation_state,
+        ];
+
+        let mut summary_lines: Vec<String> = signals
+            .iter()
+            .filter(|s| s.confidence >= CONFIDENCE_FLOOR)
+            .filter(|s| !s.label.contains("unknown") && !s.label.contains("unavailable"))
+            .map(|s| {
+                let sev = s.severity.as_deref().map(|sv| format!(" [{sv}]")).unwrap_or_default();
+                format!("  • {}{} — {}", s.label, sev, s.explanation)
+            })
+            .collect();
+
+        // Directional bias always included regardless of confidence floor.
+        summary_lines.push(format!(
+            "  • directional: {}",
+            sem.directional_bias.explanation,
+        ));
+
+        if !summary_lines.is_empty() {
+            lines.push("--- SEMANTIC SUMMARY ---".to_string());
+            lines.extend(summary_lines);
+        }
+
+        if !sem.contradictions.is_empty() {
+            lines.push("--- SIGNAL CONTRADICTIONS ---".to_string());
+            for c in &sem.contradictions {
+                lines.push(format!("  ⚠ {c}"));
+            }
+        }
+    }
 
     lines.join("\n")
 }
