@@ -24,7 +24,7 @@ pub struct TradePlan {
 enum Provider {
     OpenAI,
     Anthropic,
-    Ollama,
+    LlamaCpp,
 }
 
 #[derive(Clone)]
@@ -62,12 +62,8 @@ impl AiBroker {
         }
     }
 
-    pub fn ollama(model: String) -> Self {
-        Self::ollama_at(model, "http://localhost:11434/v1".to_string())
-    }
-
-    pub fn ollama_at(model: String, base_url: String) -> Self {
-        let api_key = "ollama".to_string();
+    pub fn llama_cpp_at(model: String, base_url: String) -> Self {
+        let api_key = "no-key".to_string();
         let api_base = base_url;
         let config = OpenAIConfig::new()
             .with_api_base(api_base.clone())
@@ -79,7 +75,7 @@ impl AiBroker {
             api_base,
             api_key,
             model,
-            provider: Provider::Ollama,
+            provider: Provider::LlamaCpp,
         }
     }
 
@@ -116,12 +112,18 @@ impl AiBroker {
                 self.api_base.trim_end_matches('/')
             ))
             .headers(headers)
-            .json(&json!({
-                "model": self.model,
-                "temperature": 0.1,
-                "response_format": { "type": "json_object" },
-                "messages": messages,
-            }))
+            .json(&{
+                let mut body = json!({
+                    "model": self.model,
+                    "temperature": 0.1,
+                    "response_format": { "type": "json_object" },
+                    "messages": messages,
+                });
+                if matches!(self.provider, Provider::LlamaCpp) {
+                    body["chat_template_kwargs"] = json!({ "enable_thinking": false });
+                }
+                body
+            })
             .send()
             .await
             .context("failed to send LLM chat completion request")?;

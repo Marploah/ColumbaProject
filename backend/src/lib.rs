@@ -58,7 +58,7 @@ struct AppState {
 #[derive(Debug, Deserialize)]
 struct AnalyzeRequest {
     messages: Vec<ChatMessage>,
-    ollama_url: Option<String>,
+    llama_server_url: Option<String>,
     position_size_pct: Option<f64>,
     leverage: Option<f64>,
 }
@@ -444,12 +444,15 @@ pub async fn run() -> Result<()> {
     let ai = match determine_execution_target(&execution_mode, preferred_model) {
         AgentTarget::Local(model) => {
             let url = env::var("COLUMBA_LLAMA_SERVER_URL")
-                .unwrap_or_else(|_| "http://localhost:11434/v1".to_string());
-            AiBroker::ollama_at(model, url)
+                .unwrap_or_else(|_| "http://127.0.0.1:8081/v1".to_string());
+            AiBroker::llama_cpp_at(model, url)
         }
         AgentTarget::Cloud(_model) if api_key.is_empty() => {
-            warn!("OPENAI_API_KEY is unset; falling back to local Ollama model");
-            AiBroker::ollama("llama3.2:3b".to_string())
+            warn!("OPENAI_API_KEY is unset; falling back to local llama-server");
+            let model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "qwen3-4b".to_string());
+            let url = env::var("COLUMBA_LLAMA_SERVER_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:8081/v1".to_string());
+            AiBroker::llama_cpp_at(model, url)
         }
         AgentTarget::Cloud(model) if api_key.starts_with("sk-ant-") => {
             let anthropic_model =
@@ -758,10 +761,10 @@ async fn analyze(
 ) -> Result<Json<AnalyzeResponse>, (axum::http::StatusCode, String)> {
     let market = state.market.read().await.clone();
 
-    let broker = match request.ollama_url {
+    let broker = match request.llama_server_url {
         Some(url) if !url.is_empty() => {
-            let model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "llama3.2:3b".to_string());
-            AiBroker::ollama_at(model, url)
+            let model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "qwen3-4b".to_string());
+            AiBroker::llama_cpp_at(model, url)
         }
         _ => state.ai.clone(),
     };

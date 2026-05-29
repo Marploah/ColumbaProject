@@ -68,8 +68,8 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [positionSizePct, setPositionSizePct] = useState(1.0);
   const [leverage, setLeverage] = useState(1);
-  const [ollamaUrl, setOllamaUrl] = useState(
-    () => localStorage.getItem('columba_ollama_url') ?? 'http://localhost:11434/v1',
+  const [llamaServerUrl, setLlamaServerUrl] = useState(
+    () => localStorage.getItem('columba_llama_server_url') ?? 'http://127.0.0.1:8081/v1',
   );
   const [indicatorConfig, setIndicatorConfig] = useState<IndicatorConfig>(() => {
     try {
@@ -217,7 +217,7 @@ export default function App() {
   }, [snapshot]);
 
   function saveSettings() {
-    localStorage.setItem('columba_ollama_url', ollamaUrl);
+    localStorage.setItem('columba_llama_server_url', llamaServerUrl);
     localStorage.setItem('columba_indicators', JSON.stringify(indicatorConfig));
     chartManagerRef.current?.setIndicatorConfig(indicatorConfig);
     setSettingsOpen(false);
@@ -246,7 +246,7 @@ export default function App() {
         position_size_pct: positionSizePct,
         leverage,
       };
-      if (ollamaUrl) body.ollama_url = ollamaUrl;
+      if (llamaServerUrl) body.llama_server_url = llamaServerUrl;
 
       const response = await fetch(`${apiBase}/api/analyze`, {
         method: 'POST',
@@ -450,12 +450,12 @@ export default function App() {
             </p>
 
             <label className="select-label">
-              Ollama base URL
+              llama-server URL
               <input
                 type="text"
-                value={ollamaUrl}
-                onChange={(e) => setOllamaUrl(e.target.value)}
-                placeholder="http://localhost:11434/v1"
+                value={llamaServerUrl}
+                onChange={(e) => setLlamaServerUrl(e.target.value)}
+                placeholder="http://127.0.0.1:8081/v1"
               />
             </label>
 

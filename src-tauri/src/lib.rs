@@ -22,7 +22,7 @@ pub fn run() {
             );
             let model_path = resource_dir
                 .join("models")
-                .join("Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf");
+                .join("Qwen3-4B-Q4_K_M.gguf");
 
             let model_is_real = model_path
                 .metadata()
