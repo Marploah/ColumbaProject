@@ -1,5 +1,8 @@
 mod ai;
 mod hardware;
+pub mod hardware_profiles;
+pub mod model_manager;
+pub mod model_selector;
 mod quant;
 mod trade_log;
 
@@ -15,7 +18,7 @@ use axum::{
     routing::{get, patch, post, put},
     Json, Router,
 };
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use hardware::{determine_execution_target, AgentTarget};
 use trade_log::TradeLog;
 use quant::{
@@ -33,8 +36,15 @@ use std::{
 };
 use axum::http::{header, HeaderValue, Method};
 use std::sync::RwLock as StdRwLock;
-use tokio::sync::{broadcast, mpsc, watch, Mutex, RwLock};
-use tokio_tungstenite::connect_async;
+use tokio::sync::{broadcast, mpsc, watch, Mutex, RwLock, Semaphore};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{
+        handshake::client::generate_key,
+        http::Request as WsRequest,
+        Message as WsMessage,
+    },
+};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info, warn};
 
@@ -53,6 +63,7 @@ struct AppState {
     current_liquidity_walls: Arc<Mutex<LiquidityWalls>>,
     current_funding_rate: Arc<Mutex<Option<f64>>>,
     trade_log: TradeLog,
+    monitor_semaphore: Arc<Semaphore>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,6 +110,8 @@ fn bucket_ms_from_interval(s: &str) -> Option<i64> {
 
 #[derive(Debug, Deserialize)]
 struct BinanceAggTrade {
+    #[serde(rename = "a")]
+    agg_id: i64,
     #[serde(rename = "p")]
     price: String,
     #[serde(rename = "q")]
@@ -522,12 +535,23 @@ pub async fn run() -> Result<()> {
         current_liquidity_walls: Arc::clone(&liquidity_walls_arc),
         current_funding_rate: Arc::clone(&funding_rate_arc),
         trade_log,
+        monitor_semaphore: Arc::new(Semaphore::new(5)),
     };
 
     let oi_symbol_rx = symbol_rx.clone();
     let walls_symbol_rx = symbol_rx.clone();
     let fr_symbol_rx = symbol_rx.clone();
     let tf_symbol_rx = symbol_rx.clone();
+    // Seed the trade processor immediately so it starts with the full 1500-candle
+    // history instead of an empty buffer. Without this, the first WS broadcast
+    // would overwrite state.market with a single live candle.
+    let seed_candles = state.market.read().await.candles.clone();
+    state
+        .trade_tx
+        .send(TradeMessage::ResetSymbol { candles: seed_candles })
+        .await
+        .ok();
+
     tokio::spawn(stream_binance_agg_trades(symbol.clone(), trade_tx, symbol_rx));
     tokio::spawn(process_trade_deltas(
         trade_rx,
@@ -675,6 +699,11 @@ async fn set_symbol(
 ) -> Result<StatusCode, (StatusCode, String)> {
     let sym = req.symbol.to_ascii_lowercase();
     let interval = state.current_interval.lock().await.clone();
+
+    // Idempotent: skip full reset if symbol didn't change (prevents double-fire on page load).
+    if state.market.read().await.symbol.to_ascii_lowercase() == sym {
+        return Ok(StatusCode::OK);
+    }
     info!("switching active symbol to {} (interval={})", sym.to_ascii_uppercase(), interval);
 
     // Notify polling tasks immediately so they stop writing stale-symbol data
@@ -724,6 +753,11 @@ async fn set_interval(
     })?;
 
     let sym = state.market.read().await.symbol.to_ascii_lowercase();
+
+    // Idempotent: skip reset if interval didn't change.
+    if *state.current_interval.lock().await == req.interval {
+        return Ok(StatusCode::OK);
+    }
     info!("switching interval to {} for {}", req.interval, sym.to_ascii_uppercase());
 
     let (candles, oi_is_real) = fetch_klines_with_oi(&sym, &req.interval).await.map_err(internal_error)?;
@@ -755,6 +789,12 @@ async fn set_interval(
     Ok(StatusCode::OK)
 }
 
+fn is_local_url(url: &str) -> bool {
+    url.starts_with("http://127.0.0.1:")
+        || url.starts_with("http://localhost:")
+        || url.starts_with("http://[::1]:")
+}
+
 async fn analyze(
     State(state): State<AppState>,
     Json(request): Json<AnalyzeRequest>,
@@ -763,6 +803,9 @@ async fn analyze(
 
     let broker = match request.llama_server_url {
         Some(url) if !url.is_empty() => {
+            if !is_local_url(&url) {
+                return Err((StatusCode::BAD_REQUEST, "llama_server_url must point to localhost".to_string()));
+            }
             let model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "qwen3-4b".to_string());
             AiBroker::llama_cpp_at(model, url)
         }
@@ -791,14 +834,22 @@ async fn analyze(
     };
 
     if let Some(id) = trade_log_id {
-        tokio::spawn(monitor_trade_outcome(
-            state.trade_log.clone(),
-            id,
-            target.entry_price,
-            target.take_profit,
-            target.stop_loss,
-            state.price_tx.subscribe(),
-        ));
+        match Arc::clone(&state.monitor_semaphore).try_acquire_owned() {
+            Ok(permit) => {
+                let log = state.trade_log.clone();
+                let price_rx = state.price_tx.subscribe();
+                let entry = target.entry_price;
+                let tp = target.take_profit;
+                let sl = target.stop_loss;
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    monitor_trade_outcome(log, id, entry, tp, sl, price_rx).await;
+                });
+            }
+            Err(_) => {
+                warn!("trade {id}: monitor capacity full (5 active); outcome auto-detection skipped");
+            }
+        }
     }
 
     Ok(Json(AnalyzeResponse { target, trade_log_id }))
@@ -842,11 +893,61 @@ async fn handle_ws_client(mut socket: WebSocket, state: AppState) {
     }
 
     let mut rx = state.snapshot_tx.subscribe();
-    while let Ok(data) = rx.recv().await {
-        if socket.send(Message::Text(data.into())).await.is_err() {
-            break;
+    loop {
+        tokio::select! {
+            result = rx.recv() => {
+                match result {
+                    Ok(data) => {
+                        if socket.send(Message::Text(data.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("ws client lagged by {n} messages; resuming from next");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Ping(data))) => {
+                        let _ = socket.send(Message::Pong(data)).await;
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(_)) => break,
+                    _ => {}
+                }
+            }
         }
     }
+}
+
+async fn poll_rest_agg_trades(
+    symbol: &str,
+    last_agg_id: &mut i64,
+    sender: &mpsc::Sender<TradeMessage>,
+) -> bool {
+    let url = format!(
+        "https://fapi.binance.com/fapi/v1/aggTrades?symbol={}&limit=100",
+        symbol.to_ascii_uppercase()
+    );
+    let trades: Vec<BinanceAggTrade> = match reqwest::get(&url).await {
+        Ok(r) => match r.json().await {
+            Ok(v) => v,
+            Err(e) => { warn!("aggTrade REST parse error: {e}"); return true; }
+        },
+        Err(e) => { warn!("aggTrade REST request error: {e}"); return true; }
+    };
+    for trade in trades {
+        if trade.agg_id <= *last_agg_id {
+            continue;
+        }
+        *last_agg_id = trade.agg_id;
+        if sender.send(TradeMessage::Trade(trade)).await.is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 async fn stream_binance_agg_trades(
@@ -862,49 +963,110 @@ async fn stream_binance_agg_trades(
             current_symbol.to_ascii_lowercase()
         );
 
-        match connect_async(endpoint.as_str()).await {
-            Ok((socket, _)) => {
-                info!("connected to Binance aggTrade stream: {endpoint}");
-                let (_, mut read) = socket.split();
+        let ws_request = WsRequest::builder()
+            .uri(endpoint.as_str())
+            .header("Host", "fstream.binance.com")
+            .header("User-Agent", "Mozilla/5.0 columba/0.1")
+            .header("Origin", "https://fstream.binance.com")
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", generate_key())
+            .body(())
+            .expect("valid ws request");
 
-                loop {
+        let ws_ok = match connect_async(ws_request).await {
+            Ok((mut socket, _)) => {
+                info!("connected to Binance futures aggTrade stream: {endpoint}");
+                let mut frames_received = false;
+                let silence_deadline = Duration::from_secs(6);
+
+                let result = loop {
                     tokio::select! {
-                        msg = read.next() => {
+                        msg = tokio::time::timeout(silence_deadline, socket.next()) => {
                             match msg {
-                                Some(Ok(msg)) if msg.is_text() => {
+                                Ok(Some(Ok(raw))) if raw.is_text() => {
+                                    frames_received = true;
                                     match serde_json::from_str::<BinanceAggTrade>(
-                                        msg.to_text().unwrap_or_default(),
+                                        raw.to_text().unwrap_or_default(),
                                     ) {
                                         Ok(trade) => {
                                             if sender.send(TradeMessage::Trade(trade)).await.is_err() {
-                                                warn!("trade processor channel closed");
-                                                return;
+                                                break Err("channel closed");
                                             }
                                         }
-                                        Err(err) => warn!("invalid Binance aggTrade payload: {err}"),
+                                        Err(err) => warn!("invalid futures aggTrade payload: {err}"),
                                     }
                                 }
-                                Some(Ok(_)) => {}
-                                Some(Err(err)) => {
-                                    warn!("Binance websocket read error: {err}");
-                                    break;
+                                Ok(Some(Ok(WsMessage::Ping(data)))) => {
+                                    let _ = socket.send(WsMessage::Pong(data)).await;
                                 }
-                                None => break,
+                                Ok(Some(Ok(_))) => {}
+                                Ok(Some(Err(err))) => {
+                                    warn!("futures WS read error: {err}");
+                                    break Ok(false);
+                                }
+                                Ok(None) => break Ok(false),
+                                Err(_) => {
+                                    // timeout — silence detected
+                                    if !frames_received {
+                                        info!("futures WS silent for {}s, switching to REST fallback", silence_deadline.as_secs());
+                                    }
+                                    break Ok(frames_received);
+                                }
                             }
                         }
                         Ok(()) = symbol_rx.changed() => {
                             current_symbol = symbol_rx.borrow_and_update().clone();
-                            info!("symbol change detected, reconnecting to {}", current_symbol.to_ascii_uppercase());
-                            // ResetSymbol with seeded candles is sent by set_symbol handler directly.
-                            break;
+                            info!("symbol change, reconnecting to {}", current_symbol.to_ascii_uppercase());
+                            break Ok(true);
                         }
+                    }
+                };
+
+                match result {
+                    Err(_) => return,
+                    Ok(had_frames) => had_frames,
+                }
+            }
+            Err(err) => {
+                warn!("futures WS connect failed: {err}");
+                false
+            }
+        };
+
+        if !ws_ok {
+            // Futures WS delivered no frames — fall back to REST polling.
+            // Retry WS periodically so we switch back if the block lifts.
+            info!("entering REST-poll fallback for {}", current_symbol.to_ascii_uppercase());
+            let mut last_agg_id: i64 = -1;
+            let mut ws_retry_interval = tokio::time::interval(Duration::from_secs(60));
+            ws_retry_interval.tick().await; // consume the immediate tick
+
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                        if !poll_rest_agg_trades(&current_symbol, &mut last_agg_id, &sender).await {
+                            return;
+                        }
+                    }
+                    _ = ws_retry_interval.tick() => {
+                        // Periodically try WS again — exit REST loop to re-attempt.
+                        info!("retrying futures WS for {}", current_symbol.to_ascii_uppercase());
+                        break;
+                    }
+                    Ok(()) = symbol_rx.changed() => {
+                        current_symbol = symbol_rx.borrow_and_update().clone();
+                        info!("symbol change in REST fallback, reconnecting to {}", current_symbol.to_ascii_uppercase());
+                        break;
                     }
                 }
             }
-            Err(err) => warn!("Binance websocket connection failed: {err}"),
+            // No extra sleep before WS retry.
+            continue;
         }
 
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
     }
 }
 
@@ -917,6 +1079,9 @@ async fn monitor_trade_outcome(
     mut price_rx: broadcast::Receiver<f64>,
 ) {
     let is_long = take_profit >= entry_price;
+    // Must see price on the approach side (above entry for long, below for short) before
+    // counting a fill. Prevents phantom fills when price is already past entry at plan time.
+    let mut has_approach = false;
     let mut has_entry = false;
     let mut ticks_since_entry: u32 = 0;
     const MIN_TICKS: u32 = 3;
@@ -933,10 +1098,18 @@ async fn monitor_trade_outcome(
             }
             result = price_rx.recv() => match result {
                 Ok(p) => p,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("trade {trade_log_id} monitor lagged {n} ticks; TP/SL may have been missed");
+                    continue;
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             }
         };
+
+        if !has_approach {
+            has_approach = if is_long { price > entry_price } else { price < entry_price };
+            continue;
+        }
 
         if !has_entry {
             let hit = if is_long { price <= entry_price } else { price >= entry_price };
