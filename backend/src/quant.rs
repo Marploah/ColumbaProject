@@ -1,4 +1,5 @@
 use crate::state::derivatives::{BasisRegime, BasisState, GlobalOIState, LiquidationState};
+use crate::state::liquidity::LiquidityAnalytics;
 use crate::state::orderflow::OrderflowState;
 use crate::state::volatility::{VolatilityRegime, VolatilityState};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
@@ -77,6 +78,10 @@ pub struct UnifiedMarketState {
     pub orderflow: OrderflowState,
     /// Volatility regime and ATR percentile relative to rolling candle history.
     pub volatility: VolatilityState,
+    /// Wall persistence, spoof, and replenishment analytics from depth history.
+    /// Internal only — not serialized to the frontend wire.
+    #[serde(skip)]
+    pub liquidity_analytics: LiquidityAnalytics,
 }
 
 #[derive(Debug, Clone)]
@@ -903,6 +908,7 @@ mod tests {
             "BTCUSDT".to_string(),
             candles,
             LiquidityWalls::default(),
+            crate::state::liquidity::LiquidityAnalytics::default(),
             None,
             false, // oi_is_real = false
             None,
@@ -1364,6 +1370,7 @@ pub fn build_unified_market_state(
     symbol: String,
     candles: Vec<CandleData>,
     liquidity_walls: LiquidityWalls,
+    liquidity_analytics: LiquidityAnalytics,
     tf_biases: Option<TfBiases>,
     oi_is_real: bool,
     funding_rate: Option<f64>,
@@ -1442,5 +1449,6 @@ pub fn build_unified_market_state(
         basis,
         orderflow,
         volatility,
+        liquidity_analytics,
     }
 }

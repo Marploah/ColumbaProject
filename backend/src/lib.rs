@@ -12,6 +12,7 @@ use ai::{AiBroker, ChatMessage, TradePlan};
 use anyhow::{Context, Result};
 use liquidations::{parse_force_order, LiquidationAggregator};
 use state::derivatives::{ExchangeOiEntry, GlobalOIState};
+use state::liquidity::WallTracker;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -27,7 +28,7 @@ use hardware::{determine_execution_target, AgentTarget};
 use trade_log::TradeLog;
 use quant::{
     apply_cvd_trade_delta, build_unified_market_state, compute_tf_bias, decimal_from_trade_qty,
-    CandleData, LiquidityWalls, SignalCache, TfBiases, UnifiedMarketState,
+    CandleData, SignalCache, TfBiases, UnifiedMarketState,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -66,7 +67,7 @@ struct AppState {
     snapshot_tx: Arc<broadcast::Sender<String>>,
     price_tx: Arc<broadcast::Sender<f64>>,
     oi_is_real: Arc<Mutex<bool>>,
-    current_liquidity_walls: Arc<Mutex<LiquidityWalls>>,
+    wall_tracker: Arc<Mutex<WallTracker>>,
     current_funding_rate: Arc<Mutex<Option<f64>>>,
     liquidation_aggregator: Arc<Mutex<LiquidationAggregator>>,
     spot_price: Arc<Mutex<Option<f64>>>,
@@ -295,52 +296,12 @@ fn rate_limit_backoff(consecutive_429s: u32) -> Duration {
     Duration::from_secs((5_u64 << consecutive_429s.min(6)).min(300))
 }
 
-// A level qualifies as a wall only if its size is >= this multiple of the mean.
-// Filters spoofed outliers that would otherwise always win a simple max() search.
-const WALL_SIGNIFICANCE_MULTIPLIER: f64 = 3.0;
-
-fn find_significant_wall(levels: &[[String; 2]]) -> (Option<f64>, Option<f64>) {
-    let parsed: Vec<(f64, f64)> = levels
-        .iter()
-        .filter_map(|[price_str, qty_str]| {
-            let price = price_str.parse::<f64>().ok()?;
-            let qty = qty_str.parse::<f64>().ok()?;
-            Some((price, qty))
-        })
-        .collect();
-
-    if parsed.is_empty() {
-        return (None, None);
-    }
-
-    let mean_qty = parsed.iter().map(|(_, q)| q).sum::<f64>() / parsed.len() as f64;
-    let threshold = mean_qty * WALL_SIGNIFICANCE_MULTIPLIER;
-
-    let best = parsed
-        .into_iter()
-        .filter(|(_, qty)| *qty >= threshold)
-        .max_by(|(_, q1), (_, q2)| q1.partial_cmp(q2).unwrap_or(std::cmp::Ordering::Equal));
-
-    match best {
-        Some((price, qty)) => (Some(price), Some(qty)),
-        None => (None, None),
-    }
-}
-
-async fn fetch_liquidity_walls(symbol: &str) -> reqwest::Result<LiquidityWalls> {
+async fn fetch_depth(symbol: &str) -> reqwest::Result<DepthResponse> {
     let url = format!(
         "https://fapi.binance.com/fapi/v1/depth?symbol={}&limit=500",
         symbol.to_ascii_uppercase()
     );
-    let data: DepthResponse = reqwest::get(&url)
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-
-    let (bid_wall_price, bid_wall_size) = find_significant_wall(&data.bids);
-    let (ask_wall_price, ask_wall_size) = find_significant_wall(&data.asks);
-    Ok(LiquidityWalls { bid_wall_price, bid_wall_size, ask_wall_price, ask_wall_size })
+    reqwest::get(&url).await?.error_for_status()?.json().await
 }
 
 async fn poll_tf_biases(
@@ -415,7 +376,7 @@ async fn poll_funding_rate(
 
 async fn poll_liquidity_walls(
     mut symbol_rx: watch::Receiver<String>,
-    current_walls: Arc<Mutex<LiquidityWalls>>,
+    wall_tracker: Arc<Mutex<WallTracker>>,
 ) {
     let mut symbol = symbol_rx.borrow().clone();
     let mut interval = tokio::time::interval(Duration::from_secs(10));
@@ -424,10 +385,10 @@ async fn poll_liquidity_walls(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                match fetch_liquidity_walls(&symbol).await {
-                    Ok(walls) => {
+                match fetch_depth(&symbol).await {
+                    Ok(depth) => {
                         consecutive_429 = 0;
-                        *current_walls.lock().await = walls;
+                        wall_tracker.lock().await.update(&depth.bids, &depth.asks, Instant::now());
                     }
                     Err(e) if e.status() == Some(reqwest::StatusCode::TOO_MANY_REQUESTS) => {
                         consecutive_429 += 1;
@@ -437,14 +398,14 @@ async fn poll_liquidity_walls(
                     }
                     Err(e) => {
                         warn!("order book fetch failed for {symbol}: {e}");
-                        *current_walls.lock().await = LiquidityWalls::default();
+                        wall_tracker.lock().await.mark_unhealthy();
                     }
                 }
             }
             Ok(()) = symbol_rx.changed() => {
                 symbol = symbol_rx.borrow_and_update().clone();
                 consecutive_429 = 0;
-                *current_walls.lock().await = LiquidityWalls::default();
+                wall_tracker.lock().await.reset();
             }
         }
     }
@@ -797,15 +758,24 @@ pub async fn run() -> Result<()> {
         }
     };
 
-    let (initial_tf_biases, initial_walls_result) =
-        tokio::join!(fetch_tf_biases(&symbol), fetch_liquidity_walls(&symbol));
-    let initial_walls = initial_walls_result.unwrap_or_default();
+    let (initial_tf_biases, initial_depth_result) =
+        tokio::join!(fetch_tf_biases(&symbol), fetch_depth(&symbol));
     let tf_biases = Arc::new(Mutex::new(initial_tf_biases.clone()));
     let binance_oi_tracker: Arc<Mutex<OiTracker>> = Arc::new(Mutex::new(OiTracker::default()));
     let bybit_oi_tracker: Arc<Mutex<OiTracker>> = Arc::new(Mutex::new(OiTracker::default()));
     let okx_oi_tracker: Arc<Mutex<OiTracker>> = Arc::new(Mutex::new(OiTracker::default()));
     let oi_is_real_arc: Arc<Mutex<bool>> = Arc::new(Mutex::new(seed_oi_is_real));
-    let liquidity_walls_arc: Arc<Mutex<LiquidityWalls>> = Arc::new(Mutex::new(initial_walls.clone()));
+
+    // Seed wall tracker from the initial depth snapshot so startup state has real wall data.
+    let wall_tracker_arc: Arc<Mutex<WallTracker>> = Arc::new(Mutex::new(WallTracker::default()));
+    if let Ok(depth) = initial_depth_result {
+        wall_tracker_arc.lock().await.update(&depth.bids, &depth.asks, Instant::now());
+    }
+    let (initial_walls, initial_liquidity_analytics) = {
+        let t = wall_tracker_arc.lock().await;
+        (t.snapshot_walls(), t.snapshot_analytics())
+    };
+
     let funding_rate_arc: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
 
     let liquidation_aggregator_arc: Arc<Mutex<LiquidationAggregator>> =
@@ -816,6 +786,7 @@ pub async fn run() -> Result<()> {
         symbol.to_uppercase(),
         initial_candles,
         initial_walls,
+        initial_liquidity_analytics,
         Some(initial_tf_biases),
         seed_oi_is_real,
         None,
@@ -856,7 +827,7 @@ pub async fn run() -> Result<()> {
         snapshot_tx: Arc::clone(&snapshot_tx),
         price_tx: Arc::clone(&price_tx),
         oi_is_real: Arc::clone(&oi_is_real_arc),
-        current_liquidity_walls: Arc::clone(&liquidity_walls_arc),
+        wall_tracker: Arc::clone(&wall_tracker_arc),
         current_funding_rate: Arc::clone(&funding_rate_arc),
         liquidation_aggregator: Arc::clone(&liquidation_aggregator_arc),
         spot_price: Arc::clone(&spot_price_arc),
@@ -891,7 +862,7 @@ pub async fn run() -> Result<()> {
         Arc::clone(&bybit_oi_tracker),
         Arc::clone(&okx_oi_tracker),
         Arc::clone(&oi_is_real_arc),
-        Arc::clone(&liquidity_walls_arc),
+        Arc::clone(&wall_tracker_arc),
         Arc::clone(&funding_rate_arc),
         Arc::clone(&liquidation_aggregator_arc),
         Arc::clone(&spot_price_arc),
@@ -902,7 +873,7 @@ pub async fn run() -> Result<()> {
     tokio::spawn(poll_bybit_oi(bybit_oi_rx, Arc::clone(&bybit_oi_tracker)));
     tokio::spawn(poll_okx_oi(okx_oi_rx, Arc::clone(&okx_oi_tracker)));
     tokio::spawn(poll_spot_price(spot_symbol_rx, Arc::clone(&spot_price_arc)));
-    tokio::spawn(poll_liquidity_walls(walls_symbol_rx, Arc::clone(&liquidity_walls_arc)));
+    tokio::spawn(poll_liquidity_walls(walls_symbol_rx, Arc::clone(&wall_tracker_arc)));
     tokio::spawn(poll_funding_rate(fr_symbol_rx, Arc::clone(&funding_rate_arc)));
     tokio::spawn(poll_tf_biases(tf_symbol_rx, Arc::clone(&state.tf_biases)));
     tokio::spawn(stream_liquidations(liq_symbol_rx, Arc::clone(&liquidation_aggregator_arc)));
@@ -1052,7 +1023,7 @@ async fn set_symbol(
     state.bybit_oi_tracker.lock().await.reset();
     state.okx_oi_tracker.lock().await.reset();
     *state.current_funding_rate.lock().await = None;
-    *state.current_liquidity_walls.lock().await = LiquidityWalls::default();
+    state.wall_tracker.lock().await.reset();
 
     let (candles, oi_is_real) = fetch_klines_with_oi(&sym, &interval).await.map_err(internal_error)?;
     let tf_biases_val = fetch_tf_biases(&sym).await;
@@ -1060,13 +1031,17 @@ async fn set_symbol(
     *state.oi_is_real.lock().await = oi_is_real;
 
     *state.spot_price.lock().await = None;
-    let walls = state.current_liquidity_walls.lock().await.clone();
+    let (walls, liquidity_analytics) = {
+        let t = state.wall_tracker.lock().await;
+        (t.snapshot_walls(), t.snapshot_analytics())
+    };
     let fr = *state.current_funding_rate.lock().await;
     let liq_snap = state.liquidation_aggregator.lock().await.snapshot();
     let new_market = build_unified_market_state(
         sym.to_ascii_uppercase(),
         candles.clone(),
         walls,
+        liquidity_analytics,
         Some(tf_biases_val),
         oi_is_real,
         fr,
@@ -1110,7 +1085,10 @@ async fn set_interval(
     *state.tf_biases.lock().await = tf_biases_val.clone();
     *state.oi_is_real.lock().await = oi_is_real;
 
-    let walls = state.current_liquidity_walls.lock().await.clone();
+    let (walls, liquidity_analytics) = {
+        let t = state.wall_tracker.lock().await;
+        (t.snapshot_walls(), t.snapshot_analytics())
+    };
     let fr = *state.current_funding_rate.lock().await;
     let liq_snap = state.liquidation_aggregator.lock().await.snapshot();
     let spot = *state.spot_price.lock().await;
@@ -1124,6 +1102,7 @@ async fn set_interval(
         sym.to_ascii_uppercase(),
         candles.clone(),
         walls,
+        liquidity_analytics,
         Some(tf_biases_val),
         oi_is_real,
         fr,
@@ -1502,7 +1481,7 @@ async fn process_trade_deltas(
     bybit_oi_tracker: Arc<Mutex<OiTracker>>,
     okx_oi_tracker: Arc<Mutex<OiTracker>>,
     oi_is_real: Arc<Mutex<bool>>,
-    current_liquidity_walls: Arc<Mutex<LiquidityWalls>>,
+    wall_tracker: Arc<Mutex<WallTracker>>,
     current_funding_rate: Arc<Mutex<Option<f64>>>,
     liquidation_aggregator: Arc<Mutex<LiquidationAggregator>>,
     spot_price: Arc<Mutex<Option<f64>>>,
@@ -1540,7 +1519,10 @@ async fn process_trade_deltas(
                 let symbol = market.read().await.symbol.clone();
                 let biases = tf_biases.lock().await.clone();
                 let oi_real = *oi_is_real.lock().await;
-                let walls = current_liquidity_walls.lock().await.clone();
+                let (walls, liquidity_analytics) = {
+                    let t = wall_tracker.lock().await;
+                    (t.snapshot_walls(), t.snapshot_analytics())
+                };
                 let fr = *current_funding_rate.lock().await;
                 signal_cache.invalidate();
                 live_candle_closes = 0;
@@ -1556,6 +1538,7 @@ async fn process_trade_deltas(
                     symbol,
                     seeded.clone(),
                     walls,
+                    liquidity_analytics,
                     Some(biases),
                     oi_real,
                     fr,
@@ -1649,7 +1632,10 @@ async fn process_trade_deltas(
                     let symbol = market.read().await.symbol.clone();
                     let biases = tf_biases.lock().await.clone();
                     let oi_real = *oi_is_real.lock().await;
-                    let walls = current_liquidity_walls.lock().await.clone();
+                    let (walls, liquidity_analytics) = {
+                        let t = wall_tracker.lock().await;
+                        (t.snapshot_walls(), t.snapshot_analytics())
+                    };
                     let fr = *current_funding_rate.lock().await;
                     let liq_snap = liquidation_aggregator.lock().await.snapshot();
                     let global_oi = {
@@ -1663,6 +1649,7 @@ async fn process_trade_deltas(
                         symbol,
                         candles.clone(),
                         walls,
+                        liquidity_analytics,
                         Some(biases),
                         oi_real,
                         fr,

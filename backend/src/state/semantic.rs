@@ -1,5 +1,6 @@
 use crate::quant::UnifiedMarketState;
 use crate::state::derivatives::{BasisRegime, BasisState, GlobalOIState, LiquidationState};
+use crate::state::liquidity::LiquidityAnalytics;
 use crate::state::volatility::VolatilityRegime;
 
 /// A semantic interpretation of a market signal with confidence and severity.
@@ -196,34 +197,137 @@ impl SignalInterpreter {
     }
 
     fn interpret_liquidity(state: &UnifiedMarketState) -> SemanticSignal {
-        let bid = state.liquidity_walls.bid_wall_price;
-        let ask = state.liquidity_walls.ask_wall_price;
+        Self::interpret_liquidity_analytics(&state.liquidity_analytics, state)
+    }
 
-        match (bid, ask) {
+    fn interpret_liquidity_analytics(
+        analytics: &LiquidityAnalytics,
+        state: &UnifiedMarketState,
+    ) -> SemanticSignal {
+        let bid = analytics.bid_wall.as_ref();
+        let ask = analytics.ask_wall.as_ref();
+
+        // Degraded feed: fall back to basic wall presence from wire data.
+        if !analytics.feed_healthy {
+            let bw = state.liquidity_walls.bid_wall_price;
+            let aw = state.liquidity_walls.ask_wall_price;
+            return match (bw, aw) {
+                (Some(b), Some(a)) => SemanticSignal {
+                    label: "liquidity walls present both sides".to_string(),
+                    confidence: 0.45,
+                    explanation: format!(
+                        "bid wall {:.4} | ask wall {:.4} (feed degraded, no persistence data)",
+                        b, a
+                    ),
+                    severity: None,
+                },
+                (Some(b), None) => SemanticSignal {
+                    label: "support present, resistance thin".to_string(),
+                    confidence: 0.4,
+                    explanation: format!("bid wall {:.4} (feed degraded)", b),
+                    severity: None,
+                },
+                (None, Some(a)) => SemanticSignal {
+                    label: "resistance present, support thin".to_string(),
+                    confidence: 0.4,
+                    explanation: format!("ask wall {:.4} (feed degraded)", a),
+                    severity: None,
+                },
+                (None, None) => SemanticSignal {
+                    label: "liquidity vacuum".to_string(),
+                    confidence: 0.35,
+                    explanation: "no significant walls visible (feed degraded)".to_string(),
+                    severity: Some("caution".to_string()),
+                },
+            };
+        }
+
+        // Spoof alert takes priority — unreliable walls mislead directional reads.
+        if analytics.spoof_alert {
+            let detail = Self::wall_summary_line(bid, ask);
+            return SemanticSignal {
+                label: "potential order-book spoof detected".to_string(),
+                confidence: 0.70,
+                explanation: format!(
+                    "wall appeared briefly without price crossing it — treat walls as unreliable | {}",
+                    detail
+                ),
+                severity: Some("caution".to_string()),
+            };
+        }
+
+        // Build enriched description for each present wall.
+        let bid_desc = bid.map(|w| {
+            let persistence = if w.persistence_polls >= 6 {
+                "persistent"
+            } else if w.persistence_polls >= 3 {
+                "established"
+            } else {
+                "new"
+            };
+            let replenish = if w.replenishment_detected { " (replenished)" } else { "" };
+            format!("bid {:.4} [{persistence} ×{}{}]", w.price, w.persistence_polls, replenish)
+        });
+        let ask_desc = ask.map(|w| {
+            let persistence = if w.persistence_polls >= 6 {
+                "persistent"
+            } else if w.persistence_polls >= 3 {
+                "established"
+            } else {
+                "new"
+            };
+            let replenish = if w.replenishment_detected { " (replenished)" } else { "" };
+            format!("ask {:.4} [{persistence} ×{}{}]", w.price, w.persistence_polls, replenish)
+        });
+
+        // Confidence scales with wall persistence — ephemeral walls are less meaningful.
+        let base_confidence: f32 = match (bid, ask) {
+            (Some(b), Some(a)) => {
+                0.60 + 0.04 * (b.persistence_polls.min(5) + a.persistence_polls.min(5)) as f32
+            }
+            (Some(b), None) | (None, Some(b)) => {
+                0.55 + 0.05 * b.persistence_polls.min(5) as f32
+            }
+            (None, None) => 0.60,
+        };
+
+        match (bid_desc, ask_desc) {
             (Some(b), Some(a)) => SemanticSignal {
-                label: "liquidity walls present both sides".to_string(),
-                confidence: 0.75,
-                explanation: format!("bid wall {:.4} | ask wall {:.4}", b, a),
+                label: "liquidity walls both sides".to_string(),
+                confidence: base_confidence.min(0.90),
+                explanation: format!("{b} | {a}"),
                 severity: None,
             },
             (Some(b), None) => SemanticSignal {
                 label: "strong support, no visible resistance".to_string(),
-                confidence: 0.65,
-                explanation: format!("bid wall {:.4}", b),
+                confidence: base_confidence.min(0.88),
+                explanation: b,
                 severity: None,
             },
             (None, Some(a)) => SemanticSignal {
                 label: "resistance present, support thin".to_string(),
-                confidence: 0.65,
-                explanation: format!("ask wall {:.4}", a),
+                confidence: base_confidence.min(0.88),
+                explanation: a,
                 severity: None,
             },
             (None, None) => SemanticSignal {
                 label: "liquidity vacuum".to_string(),
-                confidence: 0.6,
+                confidence: 0.60,
                 explanation: "no significant walls on either side".to_string(),
                 severity: Some("caution".to_string()),
             },
+        }
+    }
+
+    fn wall_summary_line(
+        bid: Option<&crate::state::liquidity::WallInfo>,
+        ask: Option<&crate::state::liquidity::WallInfo>,
+    ) -> String {
+        match (bid, ask) {
+            (Some(b), Some(a)) => format!("bid {:.4} score={:.2} | ask {:.4} score={:.2}", b.price, b.spoof_score, a.price, a.spoof_score),
+            (Some(b), None) => format!("bid {:.4} spoof_score={:.2}", b.price, b.spoof_score),
+            (None, Some(a)) => format!("ask {:.4} spoof_score={:.2}", a.price, a.spoof_score),
+            (None, None) => "no walls".to_string(),
         }
     }
 
