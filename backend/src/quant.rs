@@ -1,4 +1,5 @@
 use crate::state::derivatives::{BasisRegime, BasisState, GlobalOIState, LiquidationState};
+use crate::state::orderflow::OrderflowState;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -71,6 +72,8 @@ pub struct UnifiedMarketState {
     pub global_oi: GlobalOIState,
     /// Perpetual vs Binance spot basis (10s poll). Default until first spot price arrives.
     pub basis: BasisState,
+    /// Advanced orderflow signals derived from the per-candle buy/sell volume split.
+    pub orderflow: OrderflowState,
 }
 
 #[derive(Debug, Clone)]
@@ -867,6 +870,163 @@ mod tests {
     fn vwap_empty_candles_returns_none() {
         assert!(calculate_vwap(&[]).is_none());
     }
+
+    // ── P5 orderflow helpers ─────────────────────────────────────────────────────
+
+    fn make_vol_candle(close: f64, buy: f64, sell: f64, volume: f64) -> CandleData {
+        CandleData {
+            timestamp: 0,
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume,
+            buy_volume: Decimal::from_f64(buy).unwrap_or(Decimal::ZERO),
+            sell_volume: Decimal::from_f64(sell).unwrap_or(Decimal::ZERO),
+            cvd: Decimal::ZERO,
+            open_interest: None,
+        }
+    }
+
+    #[test]
+    fn current_delta_buy_minus_sell() {
+        let candles = vec![
+            make_vol_candle(100.0, 3.0, 1.0, 4.0),
+            make_vol_candle(100.0, 5.0, 2.0, 7.0),
+        ];
+        assert!((compute_current_delta(&candles) - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn current_delta_empty_returns_zero() {
+        assert_eq!(compute_current_delta(&[]), 0.0);
+    }
+
+    #[test]
+    fn buy_pressure_balanced_returns_half() {
+        let candles: Vec<CandleData> = (0..7)
+            .map(|_| make_vol_candle(100.0, 1.0, 1.0, 2.0))
+            .collect();
+        let pct = compute_buy_pressure_pct(&candles);
+        assert!((pct - 0.5).abs() < 1e-9, "expected 0.5, got {pct}");
+    }
+
+    #[test]
+    fn buy_pressure_all_buys_returns_one() {
+        let candles: Vec<CandleData> = (0..7)
+            .map(|_| make_vol_candle(100.0, 2.0, 0.0, 2.0))
+            .collect();
+        let pct = compute_buy_pressure_pct(&candles);
+        assert!((pct - 1.0).abs() < 1e-9, "expected 1.0, got {pct}");
+    }
+
+    #[test]
+    fn delta_momentum_accelerating_buys_positive() {
+        // 12 candles: closed = first 11, live = last.
+        // Deltas increase monotonically → positive slope.
+        let candles: Vec<CandleData> = (0..12)
+            .map(|i| make_vol_candle(100.0, (i + 1) as f64, 1.0, (i + 2) as f64))
+            .collect();
+        let mom = compute_delta_momentum(&candles);
+        assert!(mom > 0.0, "expected positive momentum, got {mom}");
+    }
+
+    #[test]
+    fn delta_momentum_flat_returns_zero() {
+        let candles: Vec<CandleData> = (0..12)
+            .map(|_| make_vol_candle(100.0, 2.0, 2.0, 4.0))
+            .collect();
+        let mom = compute_delta_momentum(&candles);
+        assert!(mom.abs() < 1e-9, "expected ~0 momentum, got {mom}");
+    }
+
+    fn make_sweep_candle(open: f64, high: f64, low: f64, close: f64) -> CandleData {
+        CandleData {
+            timestamp: 0,
+            open,
+            high,
+            low,
+            close,
+            volume: 1.0,
+            buy_volume: Decimal::ZERO,
+            sell_volume: Decimal::ZERO,
+            cvd: Decimal::ZERO,
+            open_interest: None,
+        }
+    }
+
+    #[test]
+    fn detect_sweep_ask_large_upper_wick_bearish_close() {
+        // open=100, high=115, low=99, close=99 → upper_wick=15, body=1, ATR=5
+        // upper_wick (15) > 1.2 * ATR (6) AND bearish close → ask sweep
+        let closed = make_sweep_candle(100.0, 115.0, 99.0, 99.0);
+        let live = make_sweep_candle(99.0, 99.0, 98.0, 98.5);
+        let candles = vec![closed, live];
+        let (detected, dir) = detect_sweep(&candles, Some(5.0));
+        assert!(detected);
+        assert_eq!(dir.as_deref(), Some("ask"));
+    }
+
+    #[test]
+    fn detect_sweep_bid_large_lower_wick_bullish_close() {
+        // open=100, high=101, low=85, close=101 → lower_wick=15, ATR=5 → bid sweep
+        let closed = make_sweep_candle(100.0, 101.0, 85.0, 101.0);
+        let live = make_sweep_candle(101.0, 102.0, 100.0, 101.5);
+        let candles = vec![closed, live];
+        let (detected, dir) = detect_sweep(&candles, Some(5.0));
+        assert!(detected);
+        assert_eq!(dir.as_deref(), Some("bid"));
+    }
+
+    #[test]
+    fn detect_sweep_small_wick_returns_false() {
+        // upper_wick=1, ATR=5 → not a sweep
+        let closed = make_sweep_candle(100.0, 101.0, 99.0, 100.0);
+        let live = make_sweep_candle(100.0, 100.5, 99.5, 100.0);
+        let candles = vec![closed, live];
+        let (detected, _) = detect_sweep(&candles, Some(5.0));
+        assert!(!detected);
+    }
+
+    #[test]
+    fn detect_absorption_fires_on_high_vol_tight_range_near_wall() {
+        // History: 10 candles with volume=1.0; candidate candle: volume=3.0, close near bid wall.
+        // ATR=5.0, range=0.5 → tight (< 0.6 * ATR=3.0).
+        let mut candles: Vec<CandleData> = (0..10)
+            .map(|_| make_vol_candle(100.0, 0.5, 0.5, 1.0))
+            .collect();
+        // Closed candidate — volume=3x mean, tight range, close=100 (near bid wall at 100.1)
+        let candidate = CandleData {
+            timestamp: 0,
+            open: 100.2,
+            high: 100.45,
+            low: 99.95,
+            close: 100.0,
+            volume: 3.0,
+            buy_volume: Decimal::from_f64(2.0).unwrap(),
+            sell_volume: Decimal::from_f64(1.0).unwrap(),
+            cvd: Decimal::ZERO,
+            open_interest: None,
+        };
+        candles.push(candidate);
+        // Live candle (ignored in absorption check)
+        candles.push(make_vol_candle(100.0, 1.0, 1.0, 2.0));
+        let walls = LiquidityWalls {
+            bid_wall_price: Some(100.1),
+            bid_wall_size: Some(50.0),
+            ask_wall_price: None,
+            ask_wall_size: None,
+        };
+        assert!(detect_absorption(&candles, &walls, Some(5.0)));
+    }
+
+    #[test]
+    fn detect_absorption_no_wall_returns_false() {
+        let candles: Vec<CandleData> = (0..13)
+            .map(|_| make_vol_candle(100.0, 0.5, 0.5, 1.0))
+            .collect();
+        assert!(!detect_absorption(&candles, &LiquidityWalls::default(), Some(5.0)));
+    }
 }
 
 fn compute_basis(spot_price: Option<f64>, perp_price: f64) -> BasisState {
@@ -889,6 +1049,127 @@ fn compute_basis(spot_price: Option<f64>, perp_price: f64) -> BasisState {
         BasisRegime::StrongBackwardation
     };
     BasisState { spot_price: Some(spot), basis_pct: Some(basis_pct), regime, feed_healthy: true }
+}
+
+/// Net buy − sell for the current (last) candle in base-asset units.
+fn compute_current_delta(candles: &[CandleData]) -> f64 {
+    candles
+        .last()
+        .map(|c| {
+            c.buy_volume.to_f64().unwrap_or(0.0) - c.sell_volume.to_f64().unwrap_or(0.0)
+        })
+        .unwrap_or(0.0)
+}
+
+/// Linear-regression slope of per-candle deltas over the last `window` closed candles.
+/// Uses the same normalised linreg approach as `compute_cvd_slope`.
+/// Returns 0.0 if fewer than 2 candles available.
+fn compute_delta_momentum(candles: &[CandleData]) -> f64 {
+    const WINDOW: usize = 10;
+    // Exclude the live (last) candle — it is incomplete.
+    let closed = if candles.len() >= 2 { &candles[..candles.len() - 1] } else { return 0.0 };
+    let slice = if closed.len() >= WINDOW { &closed[closed.len() - WINDOW..] } else { closed };
+    if slice.len() < 2 {
+        return 0.0;
+    }
+    let n = slice.len() as f64;
+    let x_mean = (n - 1.0) / 2.0;
+    let deltas: Vec<f64> = slice
+        .iter()
+        .map(|c| c.buy_volume.to_f64().unwrap_or(0.0) - c.sell_volume.to_f64().unwrap_or(0.0))
+        .collect();
+    let y_mean = deltas.iter().sum::<f64>() / n;
+    let mut num = 0.0_f64;
+    let mut den = 0.0_f64;
+    for (i, &y) in deltas.iter().enumerate() {
+        let dx = i as f64 - x_mean;
+        num += dx * (y - y_mean);
+        den += dx * dx;
+    }
+    if den == 0.0 { 0.0 } else { num / den }
+}
+
+/// Buy volume as a fraction of total volume over the last `window` closed candles.
+/// Returns 0.5 (neutral) when there is insufficient history or zero total volume.
+fn compute_buy_pressure_pct(candles: &[CandleData]) -> f64 {
+    const WINDOW: usize = 5;
+    // Exclude live candle.
+    let closed = if candles.len() >= 2 { &candles[..candles.len() - 1] } else { return 0.5 };
+    let slice = if closed.len() >= WINDOW { &closed[closed.len() - WINDOW..] } else { closed };
+    let total_buy: f64 = slice.iter().map(|c| c.buy_volume.to_f64().unwrap_or(0.0)).sum();
+    let total_sell: f64 = slice.iter().map(|c| c.sell_volume.to_f64().unwrap_or(0.0)).sum();
+    let total = total_buy + total_sell;
+    if total > 0.0 { total_buy / total } else { 0.5 }
+}
+
+/// Absorption: last closed candle has elevated volume + tight range + price near a wall.
+/// Requires atr_14, walls with at least one side present, and 2+ candles.
+fn detect_absorption(
+    candles: &[CandleData],
+    walls: &LiquidityWalls,
+    atr_14: Option<f64>,
+) -> bool {
+    let Some(atr) = atr_14 else { return false };
+    if atr == 0.0 || candles.len() < 2 { return false; }
+    let closed = &candles[..candles.len() - 1];
+    let candle = closed.last().unwrap();
+    let range = candle.high - candle.low;
+    // Tight range relative to ATR.
+    if range >= 0.6 * atr { return false; }
+    // Elevated volume vs recent mean (last 10 closed, excluding the candidate itself).
+    let history = if closed.len() >= 2 { &closed[..closed.len() - 1] } else { return false };
+    let window = if history.len() >= 10 { &history[history.len() - 10..] } else { history };
+    if window.is_empty() { return false; }
+    let mean_vol = window.iter().map(|c| c.volume).sum::<f64>() / window.len() as f64;
+    if candle.volume < 1.5 * mean_vol { return false; }
+    // Price must be near a bid or ask wall (within 0.2% of close).
+    let threshold = candle.close * 0.002;
+    let near_bid = walls.bid_wall_price.map_or(false, |b| (candle.close - b).abs() <= threshold);
+    let near_ask = walls.ask_wall_price.map_or(false, |a| (a - candle.close).abs() <= threshold);
+    near_bid || near_ask
+}
+
+/// Sweep/rejection: last closed candle has a wick > 1.2× ATR in one direction,
+/// with the close in the opposite direction from the wick (reversal confirmation).
+/// Returns (detected, direction): direction is "bid" (lower wick) or "ask" (upper wick).
+fn detect_sweep(candles: &[CandleData], atr_14: Option<f64>) -> (bool, Option<String>) {
+    let Some(atr) = atr_14 else { return (false, None) };
+    if atr == 0.0 || candles.len() < 2 { return (false, None); }
+    let candle = &candles[candles.len() - 2]; // last closed
+    let upper_wick = candle.high - candle.open.max(candle.close);
+    let lower_wick = candle.open.min(candle.close) - candle.low;
+    // Ask sweep: upper wick large AND bearish close (distribution / bull trap).
+    if upper_wick > 1.2 * atr && candle.close < candle.open {
+        return (true, Some("ask".to_string()));
+    }
+    // Bid sweep: lower wick large AND bullish close (accumulation / bear trap).
+    if lower_wick > 1.2 * atr && candle.close > candle.open {
+        return (true, Some("bid".to_string()));
+    }
+    (false, None)
+}
+
+/// Assembles all advanced orderflow signals from the candle buffer.
+pub fn compute_orderflow_state(
+    candles: &[CandleData],
+    walls: &LiquidityWalls,
+    atr_14: Option<f64>,
+    cvd_seeded: bool,
+) -> OrderflowState {
+    let current_delta = compute_current_delta(candles);
+    let delta_momentum = compute_delta_momentum(candles);
+    let buy_pressure_pct = compute_buy_pressure_pct(candles);
+    let absorption_detected = detect_absorption(candles, walls, atr_14);
+    let (sweep_detected, sweep_direction) = detect_sweep(candles, atr_14);
+    OrderflowState {
+        current_delta,
+        delta_momentum,
+        buy_pressure_pct,
+        absorption_detected,
+        sweep_detected,
+        sweep_direction,
+        feed_healthy: cvd_seeded,
+    }
 }
 
 pub fn build_unified_market_state(
@@ -917,6 +1198,7 @@ pub fn build_unified_market_state(
         None => (calculate_atr_14(&candles), detect_rsi_divergence(&candles)),
     };
     let vwap = calculate_vwap(&candles);
+    let orderflow = compute_orderflow_state(&candles, &liquidity_walls, atr_14, cvd_seeded);
     let funding_hours_to_settlement = hours_to_next_funding_settlement();
     let (volatility_upper_limit, volatility_lower_limit) =
         calculate_volatility_limits(last_price, atr_14);
@@ -967,5 +1249,6 @@ pub fn build_unified_market_state(
         liquidations,
         global_oi,
         basis,
+        orderflow,
     }
 }

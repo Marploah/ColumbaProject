@@ -200,38 +200,88 @@ impl SignalInterpreter {
 
     fn interpret_orderflow(state: &UnifiedMarketState) -> SemanticSignal {
         let cvd = state.confluence.cvd_slope;
-        // CVD from klines is less reliable than live aggTrade accumulation.
+        let of = &state.orderflow;
         let confidence: f32 = if state.cvd_seeded { 0.85 } else { 0.5 };
         let warming = if !state.cvd_seeded { " (CVD warming up)" } else { "" };
 
-        if cvd > 5.0 {
-            SemanticSignal {
-                label: "aggressive buying pressure".to_string(),
-                confidence,
-                explanation: format!("CVD slope {:.2} — strong taker buy dominance{}", cvd, warming),
+        // Sweep/rejection overrides other flow labels — it is the strongest short-term signal.
+        if of.sweep_detected {
+            let dir = of.sweep_direction.as_deref().unwrap_or("unknown");
+            let (label, detail) = match dir {
+                "ask" => (
+                    "ask sweep — bull trap rejection",
+                    "upper wick > 1.2×ATR + bearish close; probable distribution / stop hunt above",
+                ),
+                "bid" => (
+                    "bid sweep — bear trap rejection",
+                    "lower wick > 1.2×ATR + bullish close; probable accumulation / stop hunt below",
+                ),
+                _ => ("sweep detected", "large wick with directional rejection"),
+            };
+            return SemanticSignal {
+                label: label.to_string(),
+                confidence: confidence * 0.95,
+                explanation: format!(
+                    "{} | CVD slope {:.2} | buy% {:.0}%{}",
+                    detail,
+                    cvd,
+                    of.buy_pressure_pct * 100.0,
+                    warming
+                ),
+                severity: Some("elevated".to_string()),
+            };
+        }
+
+        // Absorption: high volume, tight range at wall — market absorbing supply/demand.
+        if of.absorption_detected {
+            let side = if of.buy_pressure_pct > 0.52 { "demand absorbed" } else { "supply absorbed" };
+            return SemanticSignal {
+                label: format!("absorption at wall — {side}"),
+                confidence: confidence * 0.90,
+                explanation: format!(
+                    "elevated vol + tight range near wall | CVD slope {:.2} | buy% {:.0}%{}",
+                    cvd,
+                    of.buy_pressure_pct * 100.0,
+                    warming
+                ),
                 severity: None,
-            }
-        } else if cvd > 0.0 {
-            SemanticSignal {
-                label: "mild buying pressure".to_string(),
-                confidence,
-                explanation: format!("CVD slope {:.2} — moderate net buying{}", cvd, warming),
-                severity: None,
-            }
-        } else if cvd < -5.0 {
-            SemanticSignal {
-                label: "aggressive selling pressure".to_string(),
-                confidence,
-                explanation: format!("CVD slope {:.2} — strong taker sell dominance{}", cvd, warming),
-                severity: None,
-            }
+            };
+        }
+
+        // Delta momentum: accelerating in one direction across recent candles.
+        let momentum_label = if of.delta_momentum > 2.0 {
+            Some("delta momentum accelerating bullish")
+        } else if of.delta_momentum < -2.0 {
+            Some("delta momentum accelerating bearish")
         } else {
-            SemanticSignal {
-                label: "balanced flow".to_string(),
-                confidence,
-                explanation: format!("CVD slope {:.2} — no dominant side{}", cvd, warming),
-                severity: None,
-            }
+            None
+        };
+
+        // Base signal from CVD slope + buy pressure.
+        let (base_label, base_severity) = if cvd > 5.0 && of.buy_pressure_pct > 0.55 {
+            ("aggressive buying pressure", None)
+        } else if cvd > 0.0 || of.buy_pressure_pct > 0.53 {
+            ("mild buying pressure", None)
+        } else if cvd < -5.0 && of.buy_pressure_pct < 0.45 {
+            ("aggressive selling pressure", None)
+        } else if cvd < 0.0 || of.buy_pressure_pct < 0.47 {
+            ("mild selling pressure", None)
+        } else {
+            ("balanced flow", None)
+        };
+
+        let label = momentum_label.unwrap_or(base_label).to_string();
+        SemanticSignal {
+            label,
+            confidence,
+            explanation: format!(
+                "CVD slope {:.2} | buy% {:.0}% | delta momentum {:.2}{}",
+                cvd,
+                of.buy_pressure_pct * 100.0,
+                of.delta_momentum,
+                warming
+            ),
+            severity: base_severity.map(|s: &str| s.to_string()),
         }
     }
 
