@@ -356,6 +356,7 @@ fn format_market_brief(state: &UnifiedMarketState) -> String {
             &sem.liquidation_state,
             &sem.oi_divergence_state,
             &sem.basis_state,
+            &sem.sentiment_state,
         ];
 
         let mut summary_lines: Vec<String> = signals

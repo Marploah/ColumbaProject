@@ -1,6 +1,7 @@
 use crate::state::derivatives::{BasisRegime, BasisState, GlobalOIState, LiquidationState};
 use crate::state::liquidity::LiquidityAnalytics;
 use crate::state::orderflow::OrderflowState;
+use crate::state::sentiment::FearGreedState;
 use crate::state::volatility::{VolatilityRegime, VolatilityState};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
@@ -82,6 +83,9 @@ pub struct UnifiedMarketState {
     /// Internal only — not serialized to the frontend wire.
     #[serde(skip)]
     pub liquidity_analytics: LiquidityAnalytics,
+    /// Crypto Fear & Greed Index from alternative.me (polls every 5 min; updates daily).
+    /// feed_healthy=false until the first successful poll.
+    pub sentiment: FearGreedState,
 }
 
 #[derive(Debug, Clone)]
@@ -917,6 +921,7 @@ mod tests {
             crate::state::derivatives::LiquidationState::default(),
             crate::state::derivatives::GlobalOIState::default(),
             None,
+            crate::state::sentiment::FearGreedState::default(),
         );
         assert_ne!(
             state.long_short_indicator, "StrongLong",
@@ -1379,6 +1384,7 @@ pub fn build_unified_market_state(
     liquidations: LiquidationState,
     global_oi: GlobalOIState,
     spot_price: Option<f64>,
+    sentiment: FearGreedState,
 ) -> UnifiedMarketState {
     let last_price = candles
         .last()
@@ -1450,5 +1456,6 @@ pub fn build_unified_market_state(
         orderflow,
         volatility,
         liquidity_analytics,
+        sentiment,
     }
 }

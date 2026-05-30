@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use liquidations::{parse_force_order, LiquidationAggregator};
 use state::derivatives::{ExchangeOiEntry, GlobalOIState};
 use state::liquidity::WallTracker;
+use state::sentiment::FearGreedState;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -71,6 +72,7 @@ struct AppState {
     current_funding_rate: Arc<Mutex<Option<f64>>>,
     liquidation_aggregator: Arc<Mutex<LiquidationAggregator>>,
     spot_price: Arc<Mutex<Option<f64>>>,
+    fear_greed: Arc<Mutex<FearGreedState>>,
     trade_log: TradeLog,
     monitor_semaphore: Arc<Semaphore>,
 }
@@ -369,6 +371,55 @@ async fn poll_funding_rate(
                 symbol = symbol_rx.borrow_and_update().clone();
                 consecutive_429 = 0;
                 *current_funding_rate.lock().await = None;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FngDataPoint {
+    value: String,
+    value_classification: String,
+    timestamp: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FngResponse {
+    data: Vec<FngDataPoint>,
+}
+
+/// Polls the alternative.me Fear & Greed Index every 5 minutes.
+/// No symbol dependency — this is a global crypto sentiment signal.
+/// On failure marks feed_healthy=false without blocking any other pipeline.
+async fn poll_fear_greed(fear_greed: Arc<Mutex<FearGreedState>>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(300));
+    loop {
+        interval.tick().await;
+        match reqwest::get("https://api.alternative.me/fng/?limit=1&format=json").await {
+            Ok(resp) => match resp.json::<FngResponse>().await {
+                Ok(fng) if !fng.data.is_empty() => {
+                    let pt = &fng.data[0];
+                    let value = pt.value.parse::<u8>().unwrap_or(50);
+                    let timestamp = pt.timestamp.parse::<i64>().unwrap_or(0);
+                    *fear_greed.lock().await = FearGreedState {
+                        value,
+                        classification: pt.value_classification.clone(),
+                        timestamp,
+                        feed_healthy: true,
+                    };
+                }
+                Ok(_) => {
+                    fear_greed.lock().await.feed_healthy = false;
+                    warn!("fear/greed API returned empty data");
+                }
+                Err(e) => {
+                    fear_greed.lock().await.feed_healthy = false;
+                    warn!("failed to parse fear/greed response: {e}");
+                }
+            },
+            Err(e) => {
+                fear_greed.lock().await.feed_healthy = false;
+                warn!("fear/greed fetch failed: {e}");
             }
         }
     }
@@ -781,6 +832,8 @@ pub async fn run() -> Result<()> {
     let liquidation_aggregator_arc: Arc<Mutex<LiquidationAggregator>> =
         Arc::new(Mutex::new(LiquidationAggregator::default()));
     let spot_price_arc: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
+    let fear_greed_arc: Arc<Mutex<FearGreedState>> =
+        Arc::new(Mutex::new(FearGreedState::default()));
 
     let initial_market = build_unified_market_state(
         symbol.to_uppercase(),
@@ -795,6 +848,7 @@ pub async fn run() -> Result<()> {
         liquidation_aggregator_arc.lock().await.snapshot(),
         GlobalOIState::default(),
         None, // spot price not yet polled
+        FearGreedState::default(), // fear/greed not yet polled
     );
 
     let (symbol_tx, symbol_rx) = watch::channel(symbol.clone());
@@ -831,6 +885,7 @@ pub async fn run() -> Result<()> {
         current_funding_rate: Arc::clone(&funding_rate_arc),
         liquidation_aggregator: Arc::clone(&liquidation_aggregator_arc),
         spot_price: Arc::clone(&spot_price_arc),
+        fear_greed: Arc::clone(&fear_greed_arc),
         trade_log,
         monitor_semaphore: Arc::new(Semaphore::new(5)),
     };
@@ -866,6 +921,7 @@ pub async fn run() -> Result<()> {
         Arc::clone(&funding_rate_arc),
         Arc::clone(&liquidation_aggregator_arc),
         Arc::clone(&spot_price_arc),
+        Arc::clone(&fear_greed_arc),
         snapshot_tx,
         price_tx,
     ));
@@ -877,6 +933,7 @@ pub async fn run() -> Result<()> {
     tokio::spawn(poll_funding_rate(fr_symbol_rx, Arc::clone(&funding_rate_arc)));
     tokio::spawn(poll_tf_biases(tf_symbol_rx, Arc::clone(&state.tf_biases)));
     tokio::spawn(stream_liquidations(liq_symbol_rx, Arc::clone(&liquidation_aggregator_arc)));
+    tokio::spawn(poll_fear_greed(Arc::clone(&fear_greed_arc)));
 
     let allowed_origins: Vec<HeaderValue> = [
         "http://localhost:5173",
@@ -1037,6 +1094,7 @@ async fn set_symbol(
     };
     let fr = *state.current_funding_rate.lock().await;
     let liq_snap = state.liquidation_aggregator.lock().await.snapshot();
+    let fg = state.fear_greed.lock().await.clone();
     let new_market = build_unified_market_state(
         sym.to_ascii_uppercase(),
         candles.clone(),
@@ -1050,6 +1108,7 @@ async fn set_symbol(
         liq_snap,
         GlobalOIState::default(),
         None, // spot resets on symbol change; poll_spot_price will refresh
+        fg,
     );
     *state.market.write().await = new_market;
 
@@ -1098,6 +1157,7 @@ async fn set_interval(
         let o = state.okx_oi_tracker.lock().await;
         compute_global_oi_state(&b, &by, &o)
     };
+    let fg = state.fear_greed.lock().await.clone();
     let new_market = build_unified_market_state(
         sym.to_ascii_uppercase(),
         candles.clone(),
@@ -1111,6 +1171,7 @@ async fn set_interval(
         liq_snap,
         global_oi,
         spot,
+        fg,
     );
     *state.market.write().await = new_market;
     *state.current_interval.lock().await = req.interval;
@@ -1485,6 +1546,7 @@ async fn process_trade_deltas(
     current_funding_rate: Arc<Mutex<Option<f64>>>,
     liquidation_aggregator: Arc<Mutex<LiquidationAggregator>>,
     spot_price: Arc<Mutex<Option<f64>>>,
+    fear_greed: Arc<Mutex<FearGreedState>>,
     snapshot_tx: Arc<broadcast::Sender<String>>,
     price_tx: Arc<broadcast::Sender<f64>>,
 ) {
@@ -1534,6 +1596,7 @@ async fn process_trade_deltas(
                     compute_global_oi_state(&b, &by, &o)
                 };
                 let spot = *spot_price.lock().await;
+                let fg = fear_greed.lock().await.clone();
                 let reset_state = build_unified_market_state(
                     symbol,
                     seeded.clone(),
@@ -1547,6 +1610,7 @@ async fn process_trade_deltas(
                     liq_snap,
                     global_oi,
                     spot,
+                    fg,
                 );
                 if let Ok(json) = serde_json::to_string(&reset_state) {
                     let _ = snapshot_tx.send(json);
@@ -1645,6 +1709,7 @@ async fn process_trade_deltas(
                         compute_global_oi_state(&b, &by, &o)
                     };
                     let spot = *spot_price.lock().await;
+                    let fg = fear_greed.lock().await.clone();
                     let next_state = build_unified_market_state(
                         symbol,
                         candles.clone(),
@@ -1658,6 +1723,7 @@ async fn process_trade_deltas(
                         liq_snap,
                         global_oi,
                         spot,
+                        fg,
                     );
                     *market.write().await = next_state.clone();
                     if let Ok(json) = serde_json::to_string(&next_state) {

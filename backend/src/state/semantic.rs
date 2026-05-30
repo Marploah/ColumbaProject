@@ -1,6 +1,7 @@
 use crate::quant::UnifiedMarketState;
 use crate::state::derivatives::{BasisRegime, BasisState, GlobalOIState, LiquidationState};
 use crate::state::liquidity::LiquidityAnalytics;
+use crate::state::sentiment::FearGreedState;
 use crate::state::volatility::VolatilityRegime;
 
 /// A semantic interpretation of a market signal with confidence and severity.
@@ -34,6 +35,7 @@ pub struct AiSemanticState {
     pub liquidation_state: SemanticSignal,
     pub oi_divergence_state: SemanticSignal,
     pub basis_state: SemanticSignal,
+    pub sentiment_state: SemanticSignal,
     /// Cross-signal contradictions detected. Each entry is a human-readable warning.
     pub contradictions: Vec<String>,
 }
@@ -54,11 +56,14 @@ impl SignalInterpreter {
         let oi_divergence_state = Self::interpret_cross_exchange_oi(&state.global_oi);
         let basis_state = Self::interpret_basis(&state.basis);
 
+        let sentiment_state = Self::interpret_sentiment(&state.sentiment);
+
         let contradictions = Self::detect_contradictions(
             &leverage_state,
             &orderflow_state,
             &liquidation_state,
             &basis_state,
+            &sentiment_state,
             state,
         );
 
@@ -71,6 +76,7 @@ impl SignalInterpreter {
             liquidation_state,
             oi_divergence_state,
             basis_state,
+            sentiment_state,
             contradictions,
         }
     }
@@ -601,11 +607,68 @@ impl SignalInterpreter {
         }
     }
 
+    fn interpret_sentiment(fg: &FearGreedState) -> SemanticSignal {
+        if !fg.feed_healthy {
+            return SemanticSignal::unknown(
+                "sentiment unavailable",
+                "Fear & Greed feed not yet polled",
+            );
+        }
+        let v = fg.value;
+        let explanation = format!(
+            "F&G index {} ({}) — {}",
+            v,
+            fg.classification,
+            if v <= 24 { "market in capitulation zone; contrarian longs historically advantaged" }
+            else if v <= 44 { "fear-driven selling may overshoot fundamentals" }
+            else if v <= 55 { "balanced sentiment, no strong crowd positioning" }
+            else if v <= 74 { "crowd tilting bullish, complacency risk rising" }
+            else { "euphoria zone; crowd heavily long, mean-reversion risk elevated" },
+        );
+        if v <= 24 {
+            SemanticSignal {
+                label: "extreme fear".to_string(),
+                confidence: 0.85,
+                explanation,
+                severity: Some("elevated".to_string()),
+            }
+        } else if v <= 44 {
+            SemanticSignal {
+                label: "fear".to_string(),
+                confidence: 0.80,
+                explanation,
+                severity: None,
+            }
+        } else if v <= 55 {
+            SemanticSignal {
+                label: "neutral sentiment".to_string(),
+                confidence: 0.75,
+                explanation,
+                severity: None,
+            }
+        } else if v <= 74 {
+            SemanticSignal {
+                label: "greed".to_string(),
+                confidence: 0.80,
+                explanation,
+                severity: None,
+            }
+        } else {
+            SemanticSignal {
+                label: "extreme greed".to_string(),
+                confidence: 0.85,
+                explanation,
+                severity: Some("elevated".to_string()),
+            }
+        }
+    }
+
     fn detect_contradictions(
         leverage: &SemanticSignal,
         orderflow: &SemanticSignal,
         liquidation: &SemanticSignal,
         basis: &SemanticSignal,
+        sentiment: &SemanticSignal,
         state: &UnifiedMarketState,
     ) -> Vec<String> {
         let mut out = Vec::new();
@@ -685,6 +748,20 @@ impl SignalInterpreter {
         if basis.label.contains("strong backwardation") && leverage.label.contains("overcrowding — shorts") {
             out.push(
                 "strong backwardation with crowded shorts — shorts paying double (basis + funding); elevated squeeze risk"
+                    .to_string(),
+            );
+        }
+
+        // Sentiment extremes compounding or contradicting leverage positioning.
+        if sentiment.label == "extreme greed" && leverage.label.contains("overcrowding — longs") {
+            out.push(
+                "extreme greed sentiment + crowded long leverage — late-cycle euphoria; elevated mean-reversion risk"
+                    .to_string(),
+            );
+        }
+        if sentiment.label == "extreme fear" && orderflow.label.contains("buying") {
+            out.push(
+                "aggressive buying into extreme fear — potential capitulation exhaustion; watch for reversal confirmation"
                     .to_string(),
             );
         }
