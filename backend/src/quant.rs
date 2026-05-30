@@ -1,4 +1,4 @@
-use crate::state::derivatives::LiquidationState;
+use crate::state::derivatives::{BasisRegime, BasisState, GlobalOIState, LiquidationState};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,11 @@ pub struct UnifiedMarketState {
     /// Rolling liquidation metrics from the Binance !forceOrder@arr stream.
     /// feed_healthy=false until the stream connects; all USD values are zero until then.
     pub liquidations: LiquidationState,
+    /// Cross-exchange open interest snapshot (Binance + Bybit + OKX).
+    /// All entries are empty until the first poll cycle completes for each exchange.
+    pub global_oi: GlobalOIState,
+    /// Perpetual vs Binance spot basis (10s poll). Default until first spot price arrives.
+    pub basis: BasisState,
 }
 
 #[derive(Debug, Clone)]
@@ -816,6 +821,8 @@ mod tests {
             None,
             false,
             crate::state::derivatives::LiquidationState::default(),
+            crate::state::derivatives::GlobalOIState::default(),
+            None,
         );
         assert_ne!(
             state.long_short_indicator, "StrongLong",
@@ -862,6 +869,28 @@ mod tests {
     }
 }
 
+fn compute_basis(spot_price: Option<f64>, perp_price: f64) -> BasisState {
+    let Some(spot) = spot_price else {
+        return BasisState::default();
+    };
+    if spot == 0.0 {
+        return BasisState::default();
+    }
+    let basis_pct = (perp_price - spot) / spot * 100.0;
+    let regime = if basis_pct > 0.10 {
+        BasisRegime::StrongContango
+    } else if basis_pct > 0.02 {
+        BasisRegime::MildContango
+    } else if basis_pct > -0.02 {
+        BasisRegime::Neutral
+    } else if basis_pct > -0.10 {
+        BasisRegime::MildBackwardation
+    } else {
+        BasisRegime::StrongBackwardation
+    };
+    BasisState { spot_price: Some(spot), basis_pct: Some(basis_pct), regime, feed_healthy: true }
+}
+
 pub fn build_unified_market_state(
     symbol: String,
     candles: Vec<CandleData>,
@@ -872,11 +901,14 @@ pub fn build_unified_market_state(
     cache: Option<&mut SignalCache>,
     cvd_seeded: bool,
     liquidations: LiquidationState,
+    global_oi: GlobalOIState,
+    spot_price: Option<f64>,
 ) -> UnifiedMarketState {
     let last_price = candles
         .last()
         .map(|candle| candle.close)
         .unwrap_or_default();
+    let basis = compute_basis(spot_price, last_price);
     let price_trend_up = infer_price_trend(&candles);
     let cvd_slope = compute_cvd_slope(&candles);
     let oi_change_pct = calculate_open_interest_change_pct(&candles);
@@ -933,5 +965,7 @@ pub fn build_unified_market_state(
         vwap,
         cvd_seeded,
         liquidations,
+        global_oi,
+        basis,
     }
 }

@@ -17,7 +17,7 @@ async-openai = "0.26"
 axum = { version = "0.7", features = ["ws"] }
 futures-util = "0.3"
 regex = "1"
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"] }
 rust_decimal = { version = "1", features = ["serde-with-str"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

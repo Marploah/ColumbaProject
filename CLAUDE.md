@@ -10,10 +10,12 @@ ColumbaProject is a crypto futures technical analysis dashboard. Rust Axum backe
 
 ### Development (recommended — Makefile)
 ```bash
-make setup      # download llama-server (latest llama.cpp) + Qwen3-4B-Q4_K_M.gguf model
-make dev        # spawn llama-server + backend + frontend in parallel (colored output)
-make app        # frontend + Tauri desktop app in parallel
-make app-build  # tsc build → cargo tauri build (release installer)
+make setup                    # detect hardware tier, download llama-server + matching Qwen3 model pair
+make setup-tier TIER=low_end  # force a specific tier (low_end / mid_range / high_end)
+make detect-tier              # print which hardware tier was detected (no downloads)
+make dev                      # spawn llama-server + backend + frontend in parallel (colored output)
+make app                      # frontend + Tauri desktop app in parallel
+make app-build                # tsc build → cargo tauri build (release installer)
 ```
 
 ### Backend (standalone)
@@ -50,6 +52,7 @@ cd src-tauri && cargo tauri build  # release build
 | `BIND_ADDR` | `127.0.0.1:8080` | Backend listen address |
 | `COLUMBA_LLAMA_SERVER_URL` | `http://127.0.0.1:8081/v1` | llama-server endpoint (set automatically by `make dev` and Tauri when bundled llama-server launches on `:8081`) |
 | `COLUMBA_TRADE_LOG` | `columba_trades.db` | SQLite file for persisting trade plans; falls back to `:memory:` if path unwritable |
+| `COLUMBA_MODELS_DIR` | `resources/models` | Directory where GGUF models are stored; Tauri sets this to the app data dir |
 | `RUST_LOG` | `columba_backend=info,tower_http=info` | Standard tracing filter; set to `debug` to trace WS frames and polling tasks |
 | `VITE_API_BASE` | `http://127.0.0.1:8080` | Frontend-only; overrides the backend URL (e.g. for remote backend or Tauri builds) |
 
@@ -63,7 +66,7 @@ If `OPENAI_API_KEY` starts with `sk-ant-`, the backend routes to `api.anthropic.
 Binance REST klines  ──▶  startup candle seed ──▶┐
 Binance Futures WS   ──▶  Tokio socket task       │
                               │ mpsc channel       ▼
-                              └──▶ processor ──▶ Arc<Mutex<UnifiedMarketState>>
+                              └──▶ processor ──▶ Arc<RwLock<UnifiedMarketState>>
                                                    │
                              GET /api/snapshot ◀───┤
                              POST /api/analyze ◀───┘──▶ AiBroker ──▶ OpenAI / llama-server
@@ -77,13 +80,22 @@ Binance Futures WS   ──▶  Tokio socket task       │
 The backend compiles as a **library crate** (`columba-backend`). `main.rs` is a thin binary that calls `columba_backend::run()`. The Tauri app (`src-tauri`) also links against the same library.
 
 - **`lib.rs`** — `pub async fn run()`: Axum server, kline seeding, all routes, background task spawning. Routes: `GET /api/snapshot`, `POST /api/analyze`, `GET /api/trades`, `GET /api/trades/summary`, `PATCH /api/trades/:id/outcome`, `POST /api/symbol`, `POST /api/interval`, `GET /ws` (WebSocket). Four background polling tasks spawned here, each receiving a `watch::Receiver<String>` to react to symbol changes: `poll_open_interest` (15s), `poll_liquidity_walls` (10s), `poll_funding_rate` (30s), `poll_tf_biases` (5min). CORS allowlist is hardcoded to `localhost:5173`, `127.0.0.1:5173`, `tauri://localhost`, `https://tauri.localhost` — adding new origins requires editing `run()` directly. Each `POST /api/analyze` spawns a `monitor_trade_outcome` Tokio task that watches the live price broadcast and auto-sets `TP_HIT`/`SL_HIT`/`EXPIRED` in the DB; the monitor times out after 24 hours.
-- **`quant.rs`** — `UnifiedMarketState`, `CandleData`, `LiquidityWalls`, `TfBiases`, `ConfluenceMatrix`. CVD accumulation via `Decimal`, CVD slope (linear regression 20 candles), ATR-14 + RSI (`ta` crate), VWAP over candle window, funding settlement hours calculation, `build_unified_market_state` assembles all signals.
-- **`ai.rs`** — `AiBroker`, `TradePlan`, chat history pruning (master prompt + last 3 exchanges), market state injection, markdown fence stripping before JSON parse.
+- **`quant.rs`** — `UnifiedMarketState`, `CandleData`, `LiquidityWalls`, `TfBiases`, `ConfluenceMatrix`. CVD accumulation via `Decimal`, CVD slope (linear regression 20 candles), ATR-14 + RSI (`ta` crate), VWAP over candle window, funding settlement hours calculation, `build_unified_market_state` assembles all signals. `SignalCache` is a local cache inside the WS processor loop that avoids recomputing expensive quant signals on every aggTrade tick; it is invalidated on symbol/interval reset.
+- **`ai.rs`** — `AiBroker`, `TradePlan`, chat history pruning (master prompt + last 3 exchanges), market state injection, markdown fence stripping before JSON parse. `POST /api/analyze` accepts optional `llama_server_url` in the request body to override the broker URL per-request (used by the frontend settings panel).
 - **`hardware.rs`** — `nvidia-smi` VRAM scan, 3 GB safety buffer deduction, `AgentTarget` routing (Local / Cloud).
+- **`hardware_profiles.rs`** — `detect_hardware()` returns `HardwareProfile` with `ram_gb`, `physical_cores`, `vram_gb`, and `tier: HardwareTier` (`LowEnd`/`MidRange`/`HighEnd`). Detects CUDA via `nvidia-smi`, Vulkan via `vulkaninfo`. Tier drives model selection.
+- **`model_selector.rs`** — `select_model_profile(hw)` maps `HardwareTier` → `ModelProfile` with `main_model`, `draft_model`, `context_size`, `threads` (70% of physical cores), `gpu_layers` (999 for GPU, 0 for CPU-only).
+- **`model_manager.rs`** — `model_is_present(name)` validates size ≥ 50 MB and GGUF magic bytes. `download_model(url, dest, on_progress)` streams with progress callback. Models stored at `COLUMBA_MODELS_DIR` env var, fallback to `resources/models/`.
 - **`trade_log.rs`** — `TradeLog` wraps `rusqlite::Connection` (bundled SQLite) behind `Arc<Mutex<>>`. Schema: `trade_log` table with `id`, `created_at` (Unix ms), `symbol`, `entry_price`, `take_profit`, `stop_loss`, `thesis`, `outcome`, `position_size_pct`, `leverage`. New columns added via `ALTER TABLE` migrations for pre-existing databases. `POST /api/analyze` inserts a record and returns its `trade_log_id`; `PATCH /api/trades/:id/outcome` updates it post-trade. `GET /api/trades/summary` returns `TradeSummary` with win_rate, `avg_r_multiple`, `expectancy` (TP_HIT = +reward/risk R, SL_HIT = −1R).
 
 ### Tauri desktop app (`src-tauri/`)
-`src-tauri/src/lib.rs` is the Tauri entry point. On startup it: (1) looks for a bundled `llama-server[.exe]` binary next to the executable and a model at `resources/models/Qwen3-4B-Q4_K_M.gguf`, (2) if found, spawns it on port 8081 and sets `COLUMBA_LLAMA_SERVER_URL`/`COLUMBA_EXECUTION_MODE=Local`, (3) spawns `columba_backend::run()` on the Tauri async runtime. The llama-server process is killed on window close. Run `make setup` first to populate `bin/llama-server` and `resources/models/`.
+`src-tauri/src/lib.rs` is the Tauri entry point. On startup it: (1) calls `detect_hardware()` + `select_model_profile()` to determine which Qwen3 model pair to use, (2) checks model presence via `model_is_present()`, (3) if models ready, spawns llama-server via `inference_manager::spawn_llama_server()` with speculative decoding (`--model-draft`, `--parallel 2`, `--cont-batching`, `--flash-attn` when GPU), (4) spawns `columba_backend::run()`. The llama-server process is killed on window close.
+
+`src-tauri/src/inference_manager.rs` — `spawn_llama_server(bin, models_dir, profile, port)` builds the full arg list. Drops `--flash-attn` for CPU-only tiers (unsupported in some llama.cpp builds). `server_url(port)` returns the `/v1` endpoint string.
+
+Tauri commands exposed to frontend: `get_setup_status()` returns `SetupStatus` (tier, RAM/VRAM, model list with `present` flag, `ready` bool). `download_missing_model(name, url)` downloads a GGUF and emits `download_progress` events with `{ name, downloaded_bytes, total_bytes }`.
+
+`resources/model_manifest.json` — maps tier keys (`low_end`, `mid_range`, `high_end`) to `{ main: {name, url, size_mb}, draft: {name, url, size_mb} }`. Source of truth for which models to download per hardware tier.
 
 ### Frontend modules (`frontend/src/`)
 - **`ChartManager.ts`** — initializes three chart panes (candlestick+ATR, open interest, CVD), tracks `activePriceLines`; **must call `removePriceLine` on all active lines before drawing a new AI trade plan**

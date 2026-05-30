@@ -1,5 +1,5 @@
 use crate::quant::UnifiedMarketState;
-use crate::state::derivatives::LiquidationState;
+use crate::state::derivatives::{BasisRegime, BasisState, GlobalOIState, LiquidationState};
 
 /// A semantic interpretation of a market signal with confidence and severity.
 #[derive(Debug, Clone)]
@@ -30,6 +30,8 @@ pub struct AiSemanticState {
     pub orderflow_state: SemanticSignal,
     pub directional_bias: SemanticSignal,
     pub liquidation_state: SemanticSignal,
+    pub oi_divergence_state: SemanticSignal,
+    pub basis_state: SemanticSignal,
     /// Cross-signal contradictions detected. Each entry is a human-readable warning.
     pub contradictions: Vec<String>,
 }
@@ -47,11 +49,14 @@ impl SignalInterpreter {
         let orderflow_state = Self::interpret_orderflow(state);
         let directional_bias = Self::interpret_directional(state);
         let liquidation_state = Self::interpret_liquidations(&state.liquidations);
+        let oi_divergence_state = Self::interpret_cross_exchange_oi(&state.global_oi);
+        let basis_state = Self::interpret_basis(&state.basis);
 
         let contradictions = Self::detect_contradictions(
             &leverage_state,
             &orderflow_state,
             &liquidation_state,
+            &basis_state,
             state,
         );
 
@@ -62,6 +67,8 @@ impl SignalInterpreter {
             orderflow_state,
             directional_bias,
             liquidation_state,
+            oi_divergence_state,
+            basis_state,
             contradictions,
         }
     }
@@ -310,10 +317,112 @@ impl SignalInterpreter {
         }
     }
 
+    fn interpret_basis(basis: &BasisState) -> SemanticSignal {
+        if !basis.feed_healthy {
+            return SemanticSignal::unknown("basis unavailable", "spot price feed not yet connected");
+        }
+        let pct = basis.basis_pct.unwrap_or(0.0);
+        match &basis.regime {
+            BasisRegime::StrongContango => SemanticSignal {
+                label: "strong contango — longs pay heavy premium".to_string(),
+                confidence: 0.85,
+                explanation: format!(
+                    "basis {pct:+.4}% — perp well above spot; short carry advantaged"
+                ),
+                severity: Some("elevated".to_string()),
+            },
+            BasisRegime::MildContango => SemanticSignal {
+                label: "mild contango".to_string(),
+                confidence: 0.80,
+                explanation: format!("basis {pct:+.4}% — moderate long premium over spot"),
+                severity: None,
+            },
+            BasisRegime::Neutral => SemanticSignal {
+                label: "basis neutral".to_string(),
+                confidence: 0.80,
+                explanation: format!("basis {pct:+.4}% — perp aligned with spot"),
+                severity: None,
+            },
+            BasisRegime::MildBackwardation => SemanticSignal {
+                label: "mild backwardation".to_string(),
+                confidence: 0.80,
+                explanation: format!("basis {pct:+.4}% — moderate short premium over spot"),
+                severity: None,
+            },
+            BasisRegime::StrongBackwardation => SemanticSignal {
+                label: "strong backwardation — shorts pay heavy premium".to_string(),
+                confidence: 0.85,
+                explanation: format!(
+                    "basis {pct:+.4}% — perp below spot; long carry advantaged"
+                ),
+                severity: Some("elevated".to_string()),
+            },
+            BasisRegime::Unavailable => {
+                SemanticSignal::unknown("basis unavailable", "spot feed unhealthy")
+            }
+        }
+    }
+
+    fn interpret_cross_exchange_oi(global: &GlobalOIState) -> SemanticSignal {
+        let exchanges_healthy = [global.binance.healthy, global.bybit.healthy, global.okx.healthy]
+            .iter()
+            .filter(|&&h| h)
+            .count();
+
+        if exchanges_healthy < 2 {
+            return SemanticSignal::unknown(
+                "cross-exchange OI unavailable",
+                "fewer than 2 exchanges reporting — divergence not computable",
+            );
+        }
+
+        let score = global.divergence_score;
+        let label = &global.divergence_label;
+        let confidence: f32 = if exchanges_healthy == 3 { 0.85 } else { 0.65 };
+
+        let detail = {
+            let parts: Vec<String> = [
+                ("Binance", &global.binance),
+                ("Bybit", &global.bybit),
+                ("OKX", &global.okx),
+            ]
+            .iter()
+            .filter_map(|(name, e)| {
+                e.change_pct.map(|pct| format!("{name} {pct:+.2}%"))
+            })
+            .collect();
+            parts.join(" | ")
+        };
+
+        if score > 0.7 {
+            SemanticSignal {
+                label: label.clone(),
+                confidence,
+                explanation: format!("divergence score {score:.2} (high) — {detail}"),
+                severity: Some("elevated".to_string()),
+            }
+        } else if score > 0.3 {
+            SemanticSignal {
+                label: label.clone(),
+                confidence,
+                explanation: format!("divergence score {score:.2} (moderate) — {detail}"),
+                severity: None,
+            }
+        } else {
+            SemanticSignal {
+                label: label.clone(),
+                confidence,
+                explanation: format!("exchanges aligned — {detail}"),
+                severity: None,
+            }
+        }
+    }
+
     fn detect_contradictions(
         leverage: &SemanticSignal,
         orderflow: &SemanticSignal,
         liquidation: &SemanticSignal,
+        basis: &SemanticSignal,
         state: &UnifiedMarketState,
     ) -> Vec<String> {
         let mut out = Vec::new();
@@ -359,6 +468,20 @@ impl SignalInterpreter {
         {
             out.push(
                 "price trending down but CVD positive — potential accumulation / smart money entering"
+                    .to_string(),
+            );
+        }
+
+        // Strong basis deviation contradicts neutral funding (or vice-versa).
+        if basis.label.contains("strong contango") && leverage.label.contains("leverage neutral") {
+            out.push(
+                "strong contango but funding neutral — basis may be leading funding; watch for funding catch-up"
+                    .to_string(),
+            );
+        }
+        if basis.label.contains("strong backwardation") && leverage.label.contains("overcrowding — shorts") {
+            out.push(
+                "strong backwardation with crowded shorts — shorts paying double (basis + funding); elevated squeeze risk"
                     .to_string(),
             );
         }

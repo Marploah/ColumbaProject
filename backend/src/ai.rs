@@ -265,6 +265,29 @@ fn format_market_brief(state: &UnifiedMarketState) -> String {
         else { "flat" },
     ));
 
+    // Cross-exchange OI divergence (P3 signal)
+    let g = &state.global_oi;
+    let healthy_count = [g.binance.healthy, g.bybit.healthy, g.okx.healthy]
+        .iter()
+        .filter(|&&h| h)
+        .count();
+    if healthy_count >= 2 {
+        let exchange_detail: Vec<String> = [
+            ("Binance", &g.binance),
+            ("Bybit", &g.bybit),
+            ("OKX", &g.okx),
+        ]
+        .iter()
+        .filter_map(|(name, e)| e.change_pct.map(|pct| format!("{name} {pct:+.2}%")))
+        .collect();
+        lines.push(format!(
+            "Cross-exchange OI: {} | divergence score {:.2} — {}",
+            exchange_detail.join(" | "),
+            g.divergence_score,
+            g.divergence_label,
+        ));
+    }
+
     if let Some(fr) = state.funding_rate {
         let fr_pct = fr * 100.0;
         let sentiment = if fr > 0.001 {
@@ -331,6 +354,8 @@ fn format_market_brief(state: &UnifiedMarketState) -> String {
             &sem.liquidity_state,
             &sem.orderflow_state,
             &sem.liquidation_state,
+            &sem.oi_divergence_state,
+            &sem.basis_state,
         ];
 
         let mut summary_lines: Vec<String> = signals

@@ -1,5 +1,29 @@
-import { Camera, Cpu, Send, SlidersHorizontal } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import { Camera, Cpu, Download, Send, SlidersHorizontal } from 'lucide-react';
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+
+const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+
+interface ModelEntry {
+  name: string;
+  url: string;
+  size_mb: number;
+  present: boolean;
+}
+interface SetupStatus {
+  tier: string;
+  ram_gb: number;
+  vram_gb: number | null;
+  physical_cores: number;
+  models: ModelEntry[];
+  ready: boolean;
+}
+interface DownloadProgress {
+  name: string;
+  downloaded_bytes: number;
+  total_bytes: number;
+}
 import { ChartManager, DEFAULT_INDICATOR_CONFIG, IndicatorConfig, MarketSnapshot, TradePlanPayload } from './ChartManager';
 import { SimulationEngine } from './SimulationEngine';
 
@@ -63,6 +87,10 @@ export default function App() {
   const [selectedInterval, setSelectedInterval] = useState('1m');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [toasts, setToasts] = useState<{ id: number; text: string }[]>([]);
+  const [setupStatus, setSetupStatus] = useState<SetupStatus | null>(null);
+  const [downloadingModels, setDownloadingModels] = useState<Record<string, DownloadProgress>>({});
+  const [streamingThesis, setStreamingThesis] = useState<{ full: string; displayed: string } | null>(null);
+  const typewriterRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const toastIdRef = useRef(0);
   const tradeLogIdRef = useRef<number | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -93,6 +121,43 @@ export default function App() {
   // Outcome persistence is handled server-side by the trade monitor task.
   // onOutcome is intentionally not wired to avoid double-writing.
   const [emaRawInput, setEmaRawInput] = useState(indicatorConfig.emas.join(', '));
+
+  // Check setup status in Tauri mode only.
+  useEffect(() => {
+    if (!isTauri) return;
+    invoke<SetupStatus>('get_setup_status')
+      .then(setSetupStatus)
+      .catch(() => {/* ignore — stay in main app */});
+  }, []);
+
+  // Listen for download progress events when in Tauri mode.
+  useEffect(() => {
+    if (!isTauri) return;
+    const unlisten = listen<DownloadProgress>('download_progress', (event) => {
+      setDownloadingModels((prev) => ({ ...prev, [event.payload.name]: event.payload }));
+    });
+    return () => { unlisten.then((fn) => fn()); };
+  }, []);
+
+  // Typewriter: drip characters from streamingThesis.full into displayed.
+  // Effect only restarts when a new thesis arrives (full string changes).
+  useEffect(() => {
+    if (!streamingThesis) return;
+    const id = setInterval(() => {
+      setStreamingThesis((prev) => {
+        if (!prev) return null;
+        const next = prev.full.slice(0, prev.displayed.length + 4);
+        if (next.length >= prev.full.length) {
+          clearInterval(id);
+          return null;
+        }
+        return { full: prev.full, displayed: next };
+      });
+    }, 16);
+    typewriterRef.current = id;
+    return () => clearInterval(id);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [streamingThesis?.full]);
 
   useEffect(() => {
     indicatorConfigRef.current = indicatorConfig;
@@ -167,13 +232,25 @@ export default function App() {
   useEffect(() => {
     let ws: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let silenceTimer: ReturnType<typeof setTimeout> | null = null;
     let alive = true;
+
+    function resetSilenceTimer() {
+      if (silenceTimer) clearTimeout(silenceTimer);
+      silenceTimer = setTimeout(() => {
+        // No update received for 15s — backend may have lost Binance stream.
+        ws?.close();
+      }, 15_000);
+    }
 
     function connect() {
       if (!alive) return;
       ws = new WebSocket(`${wsBase}/ws`);
 
+      ws.onopen = () => resetSilenceTimer();
+
       ws.onmessage = (event) => {
+        resetSilenceTimer();
         try {
           const nextSnapshot = JSON.parse(event.data as string) as MarketSnapshot;
           setSnapshot(nextSnapshot);
@@ -185,6 +262,7 @@ export default function App() {
       };
 
       ws.onclose = () => {
+        if (silenceTimer) clearTimeout(silenceTimer);
         if (alive) reconnectTimer = setTimeout(connect, 2000);
       };
 
@@ -196,6 +274,7 @@ export default function App() {
     return () => {
       alive = false;
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (silenceTimer) clearTimeout(silenceTimer);
       ws?.close();
     };
   }, []);
@@ -267,13 +346,25 @@ export default function App() {
         stopLoss: payload.target.stop_loss,
       });
 
+      const levels = (() => {
+        const fmt = (n: number) => n.toLocaleString(undefined, { maximumFractionDigits: 4 });
+        return `Entry ${fmt(payload.target.entry_price)} · TP ${fmt(payload.target.take_profit)} · SL ${fmt(payload.target.stop_loss)}`;
+      })();
+
+      const fullContent = payload.target.thesis
+        ? `${payload.target.thesis}\n\n${levels}`
+        : levels;
+
+      // Store full content in messages immediately so it persists after typing.
       setMessages((current) => [
         ...current,
-        {
-          role: 'assistant',
-          content: formatTradePlan(payload.target),
-        },
+        { role: 'assistant', content: fullContent },
       ]);
+
+      // Typewriter starts at levels-only, drips toward fullContent.
+      if (payload.target.thesis) {
+        setStreamingThesis({ full: fullContent, displayed: levels });
+      }
     } catch (error) {
       setMessages((current) => [
         ...current,
@@ -299,6 +390,86 @@ export default function App() {
       preview.document.body.style.background = '#101418';
       preview.document.body.appendChild(screenshot);
     }
+  }
+
+  async function downloadModel(entry: ModelEntry) {
+    try {
+      await invoke('download_missing_model', { name: entry.name, url: entry.url });
+      setSetupStatus((prev) => {
+        if (!prev) return prev;
+        const updated = prev.models.map((m) =>
+          m.name === entry.name ? { ...m, present: true } : m,
+        );
+        return { ...prev, models: updated, ready: updated.every((m) => m.present) };
+      });
+    } catch (e) {
+      addToast(`Download failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  // Setup screen shown in Tauri mode when models are missing.
+  if (isTauri && setupStatus && !setupStatus.ready) {
+    const tierLabel: Record<string, string> = {
+      low_end: 'Low-end (CPU)',
+      mid_range: 'Mid-range (CPU / Vulkan)',
+      high_end: 'High-end (CUDA / Vulkan)',
+    };
+    return (
+      <main className="setup-screen">
+        <div className="setup-card">
+          <h1>Columba — First-run Setup</h1>
+          <p className="setup-meta">
+            Detected <strong>{tierLabel[setupStatus.tier] ?? setupStatus.tier}</strong>
+            {' '}· {setupStatus.ram_gb.toFixed(0)} GB RAM
+            {setupStatus.vram_gb != null && ` · ${setupStatus.vram_gb.toFixed(0)} GB VRAM`}
+            {' '}· {setupStatus.physical_cores} cores
+          </p>
+          <p className="setup-hint">
+            These models must be downloaded before Columba can run local inference.
+          </p>
+          <ul className="model-list">
+            {setupStatus.models.map((m) => {
+              const prog = downloadingModels[m.name];
+              const pct = prog && prog.total_bytes > 0
+                ? Math.round((prog.downloaded_bytes / prog.total_bytes) * 100)
+                : null;
+              return (
+                <li key={m.name} className={`model-entry ${m.present ? 'present' : ''}`}>
+                  <span className="model-name">{m.name}</span>
+                  <span className="model-size">{m.size_mb >= 1000 ? `${(m.size_mb / 1024).toFixed(1)} GB` : `${m.size_mb} MB`}</span>
+                  {m.present ? (
+                    <span className="model-status ok">✓ Ready</span>
+                  ) : prog ? (
+                    <span className="model-status downloading">
+                      {pct != null ? `${pct}%` : 'Connecting…'}
+                    </span>
+                  ) : (
+                    <button
+                      className="dl-btn"
+                      type="button"
+                      onClick={() => downloadModel(m)}
+                      disabled={!m.url}
+                    >
+                      <Download size={14} /> Download
+                    </button>
+                  )}
+                  {prog && prog.total_bytes > 0 && (
+                    <progress
+                      className="dl-progress"
+                      value={prog.downloaded_bytes}
+                      max={prog.total_bytes}
+                    />
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+          {setupStatus.models.every((m) => m.present || downloadingModels[m.name]) && (
+            <p className="setup-hint">Downloading… app will start automatically when complete.</p>
+          )}
+        </div>
+      </main>
+    );
   }
 
   return (
@@ -397,11 +568,22 @@ export default function App() {
           {messages
             .filter((message) => message.role !== 'system')
             .slice(-7)
-            .map((message, index) => (
-              <div className={`message ${message.role}`} key={`${message.role}-${index}`}>
-                {message.content}
-              </div>
-            ))}
+            .map((message, index, arr) => {
+              const isLastAssistant =
+                message.role === 'assistant' && index === arr.length - 1;
+              const content =
+                isLastAssistant && streamingThesis
+                  ? streamingThesis.displayed
+                  : message.content;
+              return (
+                <div className={`message ${message.role}`} key={`${message.role}-${index}`}>
+                  {content}
+                  {isLastAssistant && streamingThesis && (
+                    <span className="cursor-blink">▋</span>
+                  )}
+                </div>
+              );
+            })}
         </section>
 
         <form className="chat-form" onSubmit={submitAnalysis}>

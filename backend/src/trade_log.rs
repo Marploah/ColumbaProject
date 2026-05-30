@@ -18,6 +18,9 @@ pub struct TradeSummary {
     pub avg_r_multiple: Option<f64>,
     /// avg_r_multiple expressed as expectancy (same value, named for clarity).
     pub expectancy: Option<f64>,
+    /// True when any resolved trade has no position_size_pct recorded.
+    /// When true, expectancy uses equal 1R weighting and does not reflect actual $ sizing.
+    pub uniform_sizing_assumed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,6 +111,7 @@ impl TradeLog {
         let mut expired = 0usize;
         let mut pending = 0usize;
         let mut r_multiples: Vec<f64> = Vec::new();
+        let mut uniform_sizing_assumed = false;
 
         for r in &records {
             let risk = (r.entry_price - r.stop_loss).abs();
@@ -116,22 +120,37 @@ impl TradeLog {
             match r.outcome.as_deref() {
                 Some("TP_HIT") => {
                     tp_hits += 1;
+                    if r.position_size_pct.is_none() {
+                        uniform_sizing_assumed = true;
+                    }
                     if risk > f64::EPSILON {
                         r_multiples.push(reward / risk);
                     }
                 }
                 Some("SL_HIT") => {
                     sl_hits += 1;
+                    if r.position_size_pct.is_none() {
+                        uniform_sizing_assumed = true;
+                    }
                     r_multiples.push(-1.0);
                 }
-                Some("EXPIRED") => expired += 1,
+                Some("EXPIRED") => {
+                    expired += 1;
+                    if r.position_size_pct.is_none() {
+                        uniform_sizing_assumed = true;
+                    }
+                    // Expired = 0R: capital was at risk for 24h with no outcome
+                    r_multiples.push(0.0);
+                }
                 _ => pending += 1,
             }
         }
 
         let closed = tp_hits + sl_hits;
-        let win_rate = if closed > 0 {
-            Some(tp_hits as f64 / closed as f64)
+        // win_rate denominator includes expired — they are resolved but not wins
+        let resolved = closed + expired;
+        let win_rate = if resolved > 0 {
+            Some(tp_hits as f64 / resolved as f64)
         } else {
             None
         };
@@ -151,6 +170,7 @@ impl TradeLog {
             win_rate,
             avg_r_multiple: avg_r,
             expectancy: avg_r,
+            uniform_sizing_assumed,
         })
     }
 

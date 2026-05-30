@@ -11,6 +11,7 @@ mod trade_log;
 use ai::{AiBroker, ChatMessage, TradePlan};
 use anyhow::{Context, Result};
 use liquidations::{parse_force_order, LiquidationAggregator};
+use state::derivatives::{ExchangeOiEntry, GlobalOIState};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -59,13 +60,16 @@ struct AppState {
     trade_tx: mpsc::Sender<TradeMessage>,
     current_interval: Arc<Mutex<String>>,
     tf_biases: Arc<Mutex<TfBiases>>,
-    current_oi: Arc<Mutex<Option<f64>>>,
+    binance_oi_tracker: Arc<Mutex<OiTracker>>,
+    bybit_oi_tracker: Arc<Mutex<OiTracker>>,
+    okx_oi_tracker: Arc<Mutex<OiTracker>>,
     snapshot_tx: Arc<broadcast::Sender<String>>,
     price_tx: Arc<broadcast::Sender<f64>>,
     oi_is_real: Arc<Mutex<bool>>,
     current_liquidity_walls: Arc<Mutex<LiquidityWalls>>,
     current_funding_rate: Arc<Mutex<Option<f64>>>,
     liquidation_aggregator: Arc<Mutex<LiquidationAggregator>>,
+    spot_price: Arc<Mutex<Option<f64>>>,
     trade_log: TradeLog,
     monitor_semaphore: Arc<Semaphore>,
 }
@@ -97,6 +101,140 @@ struct SetSymbolRequest {
 #[derive(Debug, Deserialize)]
 struct SetIntervalRequest {
     interval: String,
+}
+
+/// Per-exchange OI tracking: previous + current sample for change_pct computation.
+/// Not serialized — internal only.
+#[derive(Default)]
+struct OiTracker {
+    current: Option<f64>,
+    previous: Option<f64>,
+    consecutive_failures: u32,
+}
+
+impl OiTracker {
+    fn update(&mut self, value: f64) {
+        self.previous = self.current;
+        self.current = Some(value);
+        self.consecutive_failures = 0;
+    }
+
+    fn fail(&mut self) {
+        self.consecutive_failures += 1;
+    }
+
+    fn reset(&mut self) {
+        self.current = None;
+        self.previous = None;
+        self.consecutive_failures = 0;
+    }
+
+    fn to_entry(&self) -> ExchangeOiEntry {
+        let change_pct = match (self.current, self.previous) {
+            (Some(c), Some(p)) if p != 0.0 => Some((c - p) / p * 100.0),
+            _ => None,
+        };
+        ExchangeOiEntry {
+            oi: self.current,
+            change_pct,
+            healthy: self.consecutive_failures < 3,
+        }
+    }
+}
+
+/// Converts a Binance symbol to OKX perpetual swap instId.
+/// `btcusdt` / `BTCUSDT` → `BTC-USDT-SWAP`
+fn to_okx_symbol(binance_symbol: &str) -> Option<String> {
+    let upper = binance_symbol.to_ascii_uppercase();
+    if let Some(base) = upper.strip_suffix("USDT") {
+        Some(format!("{base}-USDT-SWAP"))
+    } else if let Some(base) = upper.strip_suffix("BUSD") {
+        Some(format!("{base}-BUSD-SWAP"))
+    } else {
+        None
+    }
+}
+
+/// Aggregates three exchange OI trackers into a divergence-annotated `GlobalOIState`.
+fn compute_global_oi_state(
+    binance: &OiTracker,
+    bybit: &OiTracker,
+    okx: &OiTracker,
+) -> GlobalOIState {
+    let b_entry = binance.to_entry();
+    let by_entry = bybit.to_entry();
+    let o_entry = okx.to_entry();
+
+    let changes: Vec<f64> = [b_entry.change_pct, by_entry.change_pct, o_entry.change_pct]
+        .into_iter()
+        .flatten()
+        .collect();
+
+    let (divergence_score, divergence_label) = if changes.len() < 2 {
+        (0.0, "insufficient cross-exchange data".to_string())
+    } else {
+        let mean = changes.iter().sum::<f64>() / changes.len() as f64;
+        let variance =
+            changes.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / changes.len() as f64;
+        let std_dev = variance.sqrt();
+        let score = (std_dev / 0.5_f64).min(1.0);
+
+        let label = compute_oi_divergence_label(
+            b_entry.change_pct,
+            by_entry.change_pct,
+            o_entry.change_pct,
+        );
+        (score, label)
+    };
+
+    GlobalOIState {
+        binance: b_entry,
+        bybit: by_entry,
+        okx: o_entry,
+        divergence_score,
+        divergence_label,
+    }
+}
+
+fn compute_oi_divergence_label(
+    binance: Option<f64>,
+    bybit: Option<f64>,
+    okx: Option<f64>,
+) -> String {
+    let threshold = 0.1_f64;
+    let named: Vec<(&str, f64)> = [("Binance", binance), ("Bybit", bybit), ("OKX", okx)]
+        .into_iter()
+        .filter_map(|(name, v)| v.map(|v| (name, v)))
+        .collect();
+
+    if named.len() < 2 {
+        return "single-exchange data".to_string();
+    }
+
+    let rising: Vec<&str> = named
+        .iter()
+        .filter(|(_, v)| *v > threshold)
+        .map(|(n, _)| *n)
+        .collect();
+    let falling: Vec<&str> = named
+        .iter()
+        .filter(|(_, v)| *v < -threshold)
+        .map(|(n, _)| *n)
+        .collect();
+
+    if rising.len() == named.len() {
+        return "broad leverage expansion".to_string();
+    }
+    if falling.len() == named.len() {
+        return "broad deleveraging".to_string();
+    }
+    if rising.len() == 1 && falling.is_empty() {
+        return format!("{} OI rising alone", rising[0]);
+    }
+    if falling.len() == 1 && rising.is_empty() {
+        return format!("{} OI falling alone", falling[0]);
+    }
+    "exchange disagreement".to_string()
 }
 
 fn bucket_ms_from_interval(s: &str) -> Option<i64> {
@@ -403,7 +541,7 @@ async fn fetch_tf_bias_for(symbol: &str, interval: &str) -> String {
 
 async fn poll_open_interest(
     mut symbol_rx: watch::Receiver<String>,
-    current_oi: Arc<Mutex<Option<f64>>>,
+    tracker: Arc<Mutex<OiTracker>>,
 ) {
     let mut symbol = symbol_rx.borrow().clone();
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
@@ -428,19 +566,190 @@ async fn poll_open_interest(
                         match resp.json::<OiCurrentResponse>().await {
                             Ok(data) => {
                                 if let Ok(oi) = data.open_interest.parse::<f64>() {
-                                    *current_oi.lock().await = Some(oi);
+                                    tracker.lock().await.update(oi);
                                 }
                             }
-                            Err(e) => warn!("failed to parse OI response: {e:?}"),
+                            Err(e) => {
+                                tracker.lock().await.fail();
+                                warn!("failed to parse OI response: {e:?}");
+                            }
                         }
                     }
-                    Err(e) => warn!("OI poll request failed: {e:?}"),
+                    Err(e) => {
+                        tracker.lock().await.fail();
+                        warn!("OI poll request failed: {e:?}");
+                    }
                 }
             }
             Ok(()) = symbol_rx.changed() => {
                 symbol = symbol_rx.borrow_and_update().clone();
                 consecutive_429 = 0;
-                *current_oi.lock().await = None;
+                tracker.lock().await.reset();
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct BybitOiItem {
+    #[serde(rename = "openInterest")]
+    open_interest: String,
+}
+
+#[derive(Deserialize)]
+struct BybitOiResult {
+    list: Vec<BybitOiItem>,
+}
+
+#[derive(Deserialize)]
+struct BybitOiResponse {
+    #[serde(rename = "retCode")]
+    ret_code: i32,
+    result: BybitOiResult,
+}
+
+#[derive(Deserialize)]
+struct OkxOiItem {
+    oi: String,
+}
+
+#[derive(Deserialize)]
+struct OkxOiResponse {
+    code: String,
+    data: Vec<OkxOiItem>,
+}
+
+#[derive(Deserialize)]
+struct SpotPriceResponse {
+    price: String,
+}
+
+async fn poll_bybit_oi(
+    mut symbol_rx: watch::Receiver<String>,
+    tracker: Arc<Mutex<OiTracker>>,
+) {
+    let mut symbol = symbol_rx.borrow().clone();
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let sym = symbol.to_ascii_uppercase();
+                let url = format!(
+                    "https://api.bybit.com/v5/market/open-interest?category=linear&symbol={sym}&intervalTime=5min&limit=1"
+                );
+                match reqwest::get(&url).await {
+                    Ok(resp) => {
+                        match resp.json::<BybitOiResponse>().await {
+                            Ok(data) if data.ret_code == 0 => {
+                                if let Some(item) = data.result.list.first() {
+                                    if let Ok(oi) = item.open_interest.parse::<f64>() {
+                                        tracker.lock().await.update(oi);
+                                    }
+                                }
+                            }
+                            Ok(data) => {
+                                tracker.lock().await.fail();
+                                warn!("Bybit OI returned retCode={}", data.ret_code);
+                            }
+                            Err(e) => {
+                                tracker.lock().await.fail();
+                                warn!("failed to parse Bybit OI response for {sym}: {e:?}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracker.lock().await.fail();
+                        warn!("Bybit OI poll failed for {sym}: {e:?}");
+                    }
+                }
+            }
+            Ok(()) = symbol_rx.changed() => {
+                symbol = symbol_rx.borrow_and_update().clone();
+                tracker.lock().await.reset();
+            }
+        }
+    }
+}
+
+async fn poll_okx_oi(
+    mut symbol_rx: watch::Receiver<String>,
+    tracker: Arc<Mutex<OiTracker>>,
+) {
+    let mut symbol = symbol_rx.borrow().clone();
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let Some(inst_id) = to_okx_symbol(&symbol) else {
+                    warn!("cannot map symbol {} to OKX instId; skipping OI poll", symbol);
+                    continue;
+                };
+                let url = format!(
+                    "https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId={inst_id}"
+                );
+                match reqwest::get(&url).await {
+                    Ok(resp) => {
+                        match resp.json::<OkxOiResponse>().await {
+                            Ok(data) if data.code == "0" => {
+                                if let Some(item) = data.data.first() {
+                                    if let Ok(oi) = item.oi.parse::<f64>() {
+                                        tracker.lock().await.update(oi);
+                                    }
+                                }
+                            }
+                            Ok(data) => {
+                                tracker.lock().await.fail();
+                                warn!("OKX OI returned code={}", data.code);
+                            }
+                            Err(e) => {
+                                tracker.lock().await.fail();
+                                warn!("failed to parse OKX OI response for {inst_id}: {e:?}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracker.lock().await.fail();
+                        warn!("OKX OI poll failed for {inst_id}: {e:?}");
+                    }
+                }
+            }
+            Ok(()) = symbol_rx.changed() => {
+                symbol = symbol_rx.borrow_and_update().clone();
+                tracker.lock().await.reset();
+            }
+        }
+    }
+}
+
+async fn poll_spot_price(
+    mut symbol_rx: watch::Receiver<String>,
+    spot_price_arc: Arc<Mutex<Option<f64>>>,
+) {
+    let mut symbol = symbol_rx.borrow().clone();
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let sym = symbol.to_ascii_uppercase();
+                let url = format!("https://api.binance.com/api/v3/ticker/price?symbol={sym}");
+                match reqwest::get(&url).await {
+                    Ok(resp) => match resp.json::<SpotPriceResponse>().await {
+                        Ok(data) => {
+                            if let Ok(price) = data.price.parse::<f64>() {
+                                *spot_price_arc.lock().await = Some(price);
+                            }
+                        }
+                        Err(e) => warn!("spot price parse error for {sym}: {e:?}"),
+                    },
+                    Err(e) => warn!("spot price poll failed for {sym}: {e:?}"),
+                }
+            }
+            Ok(()) = symbol_rx.changed() => {
+                symbol = symbol_rx.borrow_and_update().clone();
+                *spot_price_arc.lock().await = None;
             }
         }
     }
@@ -492,13 +801,16 @@ pub async fn run() -> Result<()> {
         tokio::join!(fetch_tf_biases(&symbol), fetch_liquidity_walls(&symbol));
     let initial_walls = initial_walls_result.unwrap_or_default();
     let tf_biases = Arc::new(Mutex::new(initial_tf_biases.clone()));
-    let current_oi: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
+    let binance_oi_tracker: Arc<Mutex<OiTracker>> = Arc::new(Mutex::new(OiTracker::default()));
+    let bybit_oi_tracker: Arc<Mutex<OiTracker>> = Arc::new(Mutex::new(OiTracker::default()));
+    let okx_oi_tracker: Arc<Mutex<OiTracker>> = Arc::new(Mutex::new(OiTracker::default()));
     let oi_is_real_arc: Arc<Mutex<bool>> = Arc::new(Mutex::new(seed_oi_is_real));
     let liquidity_walls_arc: Arc<Mutex<LiquidityWalls>> = Arc::new(Mutex::new(initial_walls.clone()));
     let funding_rate_arc: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
 
     let liquidation_aggregator_arc: Arc<Mutex<LiquidationAggregator>> =
         Arc::new(Mutex::new(LiquidationAggregator::default()));
+    let spot_price_arc: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
 
     let initial_market = build_unified_market_state(
         symbol.to_uppercase(),
@@ -510,6 +822,8 @@ pub async fn run() -> Result<()> {
         None,
         false,
         liquidation_aggregator_arc.lock().await.snapshot(),
+        GlobalOIState::default(),
+        None, // spot price not yet polled
     );
 
     let (symbol_tx, symbol_rx) = watch::channel(symbol.clone());
@@ -536,18 +850,23 @@ pub async fn run() -> Result<()> {
         trade_tx: trade_tx.clone(),
         current_interval: Arc::new(Mutex::new("1m".to_string())),
         tf_biases,
-        current_oi,
+        binance_oi_tracker: Arc::clone(&binance_oi_tracker),
+        bybit_oi_tracker: Arc::clone(&bybit_oi_tracker),
+        okx_oi_tracker: Arc::clone(&okx_oi_tracker),
         snapshot_tx: Arc::clone(&snapshot_tx),
         price_tx: Arc::clone(&price_tx),
         oi_is_real: Arc::clone(&oi_is_real_arc),
         current_liquidity_walls: Arc::clone(&liquidity_walls_arc),
         current_funding_rate: Arc::clone(&funding_rate_arc),
         liquidation_aggregator: Arc::clone(&liquidation_aggregator_arc),
+        spot_price: Arc::clone(&spot_price_arc),
         trade_log,
         monitor_semaphore: Arc::new(Semaphore::new(5)),
     };
 
     let oi_symbol_rx = symbol_rx.clone();
+    let bybit_oi_rx = symbol_rx.clone();
+    let okx_oi_rx = symbol_rx.clone();
     let walls_symbol_rx = symbol_rx.clone();
     let fr_symbol_rx = symbol_rx.clone();
     let tf_symbol_rx = symbol_rx.clone();
@@ -562,20 +881,27 @@ pub async fn run() -> Result<()> {
         .ok();
 
     let liq_symbol_rx = symbol_rx.clone();
+    let spot_symbol_rx = symbol_rx.clone();
     tokio::spawn(stream_binance_agg_trades(symbol.clone(), trade_tx, symbol_rx));
     tokio::spawn(process_trade_deltas(
         trade_rx,
         Arc::clone(&state.market),
         Arc::clone(&state.tf_biases),
-        Arc::clone(&state.current_oi),
+        Arc::clone(&binance_oi_tracker),
+        Arc::clone(&bybit_oi_tracker),
+        Arc::clone(&okx_oi_tracker),
         Arc::clone(&oi_is_real_arc),
         Arc::clone(&liquidity_walls_arc),
         Arc::clone(&funding_rate_arc),
         Arc::clone(&liquidation_aggregator_arc),
+        Arc::clone(&spot_price_arc),
         snapshot_tx,
         price_tx,
     ));
-    tokio::spawn(poll_open_interest(oi_symbol_rx, Arc::clone(&state.current_oi)));
+    tokio::spawn(poll_open_interest(oi_symbol_rx, Arc::clone(&binance_oi_tracker)));
+    tokio::spawn(poll_bybit_oi(bybit_oi_rx, Arc::clone(&bybit_oi_tracker)));
+    tokio::spawn(poll_okx_oi(okx_oi_rx, Arc::clone(&okx_oi_tracker)));
+    tokio::spawn(poll_spot_price(spot_symbol_rx, Arc::clone(&spot_price_arc)));
     tokio::spawn(poll_liquidity_walls(walls_symbol_rx, Arc::clone(&liquidity_walls_arc)));
     tokio::spawn(poll_funding_rate(fr_symbol_rx, Arc::clone(&funding_rate_arc)));
     tokio::spawn(poll_tf_biases(tf_symbol_rx, Arc::clone(&state.tf_biases)));
@@ -722,7 +1048,9 @@ async fn set_symbol(
     // before we fetch and assemble the new state. Each task clears its value
     // upon receiving the watch change.
     state.symbol_tx.send(sym.clone()).ok();
-    *state.current_oi.lock().await = None;
+    state.binance_oi_tracker.lock().await.reset();
+    state.bybit_oi_tracker.lock().await.reset();
+    state.okx_oi_tracker.lock().await.reset();
     *state.current_funding_rate.lock().await = None;
     *state.current_liquidity_walls.lock().await = LiquidityWalls::default();
 
@@ -731,6 +1059,7 @@ async fn set_symbol(
     *state.tf_biases.lock().await = tf_biases_val.clone();
     *state.oi_is_real.lock().await = oi_is_real;
 
+    *state.spot_price.lock().await = None;
     let walls = state.current_liquidity_walls.lock().await.clone();
     let fr = *state.current_funding_rate.lock().await;
     let liq_snap = state.liquidation_aggregator.lock().await.snapshot();
@@ -744,6 +1073,8 @@ async fn set_symbol(
         None,
         false,
         liq_snap,
+        GlobalOIState::default(),
+        None, // spot resets on symbol change; poll_spot_price will refresh
     );
     *state.market.write().await = new_market;
 
@@ -782,6 +1113,13 @@ async fn set_interval(
     let walls = state.current_liquidity_walls.lock().await.clone();
     let fr = *state.current_funding_rate.lock().await;
     let liq_snap = state.liquidation_aggregator.lock().await.snapshot();
+    let spot = *state.spot_price.lock().await;
+    let global_oi = {
+        let b = state.binance_oi_tracker.lock().await;
+        let by = state.bybit_oi_tracker.lock().await;
+        let o = state.okx_oi_tracker.lock().await;
+        compute_global_oi_state(&b, &by, &o)
+    };
     let new_market = build_unified_market_state(
         sym.to_ascii_uppercase(),
         candles.clone(),
@@ -792,6 +1130,8 @@ async fn set_interval(
         None,
         false,
         liq_snap,
+        global_oi,
+        spot,
     );
     *state.market.write().await = new_market;
     *state.current_interval.lock().await = req.interval;
@@ -1158,11 +1498,14 @@ async fn process_trade_deltas(
     mut receiver: mpsc::Receiver<TradeMessage>,
     market: Arc<RwLock<UnifiedMarketState>>,
     tf_biases: Arc<Mutex<TfBiases>>,
-    current_oi: Arc<Mutex<Option<f64>>>,
+    binance_oi_tracker: Arc<Mutex<OiTracker>>,
+    bybit_oi_tracker: Arc<Mutex<OiTracker>>,
+    okx_oi_tracker: Arc<Mutex<OiTracker>>,
     oi_is_real: Arc<Mutex<bool>>,
     current_liquidity_walls: Arc<Mutex<LiquidityWalls>>,
     current_funding_rate: Arc<Mutex<Option<f64>>>,
     liquidation_aggregator: Arc<Mutex<LiquidationAggregator>>,
+    spot_price: Arc<Mutex<Option<f64>>>,
     snapshot_tx: Arc<broadcast::Sender<String>>,
     price_tx: Arc<broadcast::Sender<f64>>,
 ) {
@@ -1202,6 +1545,13 @@ async fn process_trade_deltas(
                 signal_cache.invalidate();
                 live_candle_closes = 0;
                 let liq_snap = liquidation_aggregator.lock().await.snapshot();
+                let global_oi = {
+                    let b = binance_oi_tracker.lock().await;
+                    let by = bybit_oi_tracker.lock().await;
+                    let o = okx_oi_tracker.lock().await;
+                    compute_global_oi_state(&b, &by, &o)
+                };
+                let spot = *spot_price.lock().await;
                 let reset_state = build_unified_market_state(
                     symbol,
                     seeded.clone(),
@@ -1212,6 +1562,8 @@ async fn process_trade_deltas(
                     None,
                     false,
                     liq_snap,
+                    global_oi,
+                    spot,
                 );
                 if let Ok(json) = serde_json::to_string(&reset_state) {
                     let _ = snapshot_tx.send(json);
@@ -1248,7 +1600,7 @@ async fn process_trade_deltas(
                 if active_bucket != bucket {
                     active_bucket = bucket;
                     live_candle_closes = live_candle_closes.saturating_add(1);
-                    let oi = *current_oi.lock().await;
+                    let oi = binance_oi_tracker.lock().await.current;
                     candles.push(CandleData {
                         timestamp: bucket * bucket_ms,
                         open: price,
@@ -1300,6 +1652,13 @@ async fn process_trade_deltas(
                     let walls = current_liquidity_walls.lock().await.clone();
                     let fr = *current_funding_rate.lock().await;
                     let liq_snap = liquidation_aggregator.lock().await.snapshot();
+                    let global_oi = {
+                        let b = binance_oi_tracker.lock().await;
+                        let by = bybit_oi_tracker.lock().await;
+                        let o = okx_oi_tracker.lock().await;
+                        compute_global_oi_state(&b, &by, &o)
+                    };
+                    let spot = *spot_price.lock().await;
                     let next_state = build_unified_market_state(
                         symbol,
                         candles.clone(),
@@ -1310,6 +1669,8 @@ async fn process_trade_deltas(
                         Some(&mut signal_cache),
                         live_candle_closes >= 1,
                         liq_snap,
+                        global_oi,
+                        spot,
                     );
                     *market.write().await = next_state.clone();
                     if let Ok(json) = serde_json::to_string(&next_state) {
