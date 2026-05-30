@@ -1,5 +1,6 @@
 use crate::quant::UnifiedMarketState;
 use crate::state::derivatives::{BasisRegime, BasisState, GlobalOIState, LiquidationState};
+use crate::state::volatility::VolatilityRegime;
 
 /// A semantic interpretation of a market signal with confidence and severity.
 #[derive(Debug, Clone)]
@@ -134,35 +135,63 @@ impl SignalInterpreter {
             );
         };
 
+        let vol = &state.volatility;
         let atr_pct = atr / state.last_price * 100.0;
 
-        if atr_pct < 0.08 {
-            SemanticSignal {
-                label: "volatility compression".to_string(),
-                confidence: 0.82,
+        let pctile_str = vol
+            .atr_percentile
+            .map(|p| format!(" | {:.0}th pctile", p))
+            .unwrap_or_default();
+
+        let dir_str = match vol.expanding {
+            Some(true) => " (expanding)",
+            Some(false) => " (contracting)",
+            None => "",
+        };
+
+        let confidence = if vol.regime_confidence > 0.0 { vol.regime_confidence } else { 0.5 };
+
+        match &vol.regime {
+            VolatilityRegime::Compression => SemanticSignal {
+                label: format!("volatility compression{dir_str}"),
+                confidence,
                 explanation: format!(
-                    "ATR {:.2}% of price — tight range, breakout conditions building",
+                    "ATR {:.2}% of price — tight range, breakout coiling{pctile_str}",
                     atr_pct
                 ),
                 severity: None,
-            }
-        } else if atr_pct > 1.0 {
-            SemanticSignal {
-                label: "volatility expansion".to_string(),
-                confidence: 0.85,
+            },
+            VolatilityRegime::Normal => SemanticSignal {
+                label: format!("normal volatility{dir_str}"),
+                confidence,
                 explanation: format!(
-                    "ATR {:.2}% of price — elevated risk, wide stops required",
+                    "ATR {:.2}% of price — balanced conditions{pctile_str}",
+                    atr_pct
+                ),
+                severity: None,
+            },
+            VolatilityRegime::Elevated => SemanticSignal {
+                label: format!("elevated volatility{dir_str}"),
+                confidence,
+                explanation: format!(
+                    "ATR {:.2}% of price — high vol, widen stops{pctile_str}",
                     atr_pct
                 ),
                 severity: Some("elevated".to_string()),
-            }
-        } else {
-            SemanticSignal {
-                label: "normal volatility".to_string(),
-                confidence: 0.75,
-                explanation: format!("ATR {:.2}% of price", atr_pct),
-                severity: None,
-            }
+            },
+            VolatilityRegime::Extreme => SemanticSignal {
+                label: format!("extreme volatility{dir_str}"),
+                confidence,
+                explanation: format!(
+                    "ATR {:.2}% of price — crisis/event conditions, avoid entries{pctile_str}",
+                    atr_pct
+                ),
+                severity: Some("high".to_string()),
+            },
+            VolatilityRegime::Unknown => SemanticSignal::unknown(
+                "volatility regime unknown",
+                "insufficient candle history for regime classification",
+            ),
         }
     }
 
@@ -518,6 +547,26 @@ impl SignalInterpreter {
         {
             out.push(
                 "price trending down but CVD positive — potential accumulation / smart money entering"
+                    .to_string(),
+            );
+        }
+
+        // Extreme volatility + crowded leverage → liquidation cascade highly probable.
+        if matches!(state.volatility.regime, VolatilityRegime::Extreme)
+            && leverage.label.contains("overcrowding")
+        {
+            out.push(
+                "extreme volatility with crowded positioning — cascade risk critical; avoid new entries"
+                    .to_string(),
+            );
+        }
+
+        // Compression + crowded leverage → spring-loaded: violent break when range resolves.
+        if matches!(state.volatility.regime, VolatilityRegime::Compression)
+            && leverage.label.contains("overcrowding")
+        {
+            out.push(
+                "volatility compression with crowded positioning — spring-loaded: large liquidation cascade probable when range breaks"
                     .to_string(),
             );
         }

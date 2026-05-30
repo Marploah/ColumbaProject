@@ -1,5 +1,6 @@
 use crate::state::derivatives::{BasisRegime, BasisState, GlobalOIState, LiquidationState};
 use crate::state::orderflow::OrderflowState;
+use crate::state::volatility::{VolatilityRegime, VolatilityState};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -74,6 +75,8 @@ pub struct UnifiedMarketState {
     pub basis: BasisState,
     /// Advanced orderflow signals derived from the per-candle buy/sell volume split.
     pub orderflow: OrderflowState,
+    /// Volatility regime and ATR percentile relative to rolling candle history.
+    pub volatility: VolatilityState,
 }
 
 #[derive(Debug, Clone)]
@@ -95,13 +98,14 @@ impl Default for TfBiases {
     }
 }
 
-/// Cache for O(n) signals that only change on candle close (ATR-14, RSI divergence).
+/// Cache for O(n) signals that only change on candle close (ATR-14, RSI divergence, volatility regime).
 /// Key: total candle count — a new candle opening increments it, invalidating the cache.
 #[derive(Default)]
 pub struct SignalCache {
     candle_count: usize,
     atr_14: Option<f64>,
     rsi_divergence: String,
+    volatility: VolatilityState,
 }
 
 impl SignalCache {
@@ -110,13 +114,14 @@ impl SignalCache {
         self.candle_count = 0;
     }
 
-    fn get_or_refresh(&mut self, candles: &[CandleData]) -> (Option<f64>, String) {
+    fn get_or_refresh(&mut self, candles: &[CandleData]) -> (Option<f64>, String, VolatilityState) {
         if self.candle_count != candles.len() {
             self.atr_14 = calculate_atr_14(candles);
             self.rsi_divergence = detect_rsi_divergence(candles);
+            self.volatility = compute_volatility_regime(candles, self.atr_14);
             self.candle_count = candles.len();
         }
-        (self.atr_14, self.rsi_divergence.clone())
+        (self.atr_14, self.rsi_divergence.clone(), self.volatility.clone())
     }
 }
 
@@ -273,6 +278,86 @@ pub fn calculate_volatility_limits(
             )
         }
         _ => (None, None),
+    }
+}
+
+/// Classifies current volatility regime by comparing ATR-14 to its rolling history.
+///
+/// Samples ATR at evenly-spaced historical endpoints (each using full candle history for stable
+/// Wilder smoothing) and computes the percentile rank of the current ATR.
+/// Returns `VolatilityState::default()` (Unknown) when history is insufficient.
+pub fn compute_volatility_regime(candles: &[CandleData], current_atr: Option<f64>) -> VolatilityState {
+    let Some(atr) = current_atr else {
+        return VolatilityState::default();
+    };
+
+    let n = candles.len();
+    if n < 30 {
+        return VolatilityState {
+            regime: VolatilityRegime::Unknown,
+            atr_percentile: None,
+            expanding: None,
+            regime_confidence: 0.3,
+        };
+    }
+
+    // Sample ATR at evenly-spaced endpoints using all prior candles for EMA warmup.
+    let step = ((n - 14) / 50).max(1);
+    let historical_atrs: Vec<f64> = (14..n)
+        .step_by(step)
+        .filter_map(|end| calculate_atr_14(&candles[..end]))
+        .collect();
+
+    if historical_atrs.len() < 5 {
+        return VolatilityState {
+            regime: VolatilityRegime::Unknown,
+            atr_percentile: None,
+            expanding: None,
+            regime_confidence: 0.3,
+        };
+    }
+
+    // Midpoint rank: ties contribute 0.5 each so identical ATR history → 50th percentile.
+    let below = historical_atrs.iter().filter(|&&h| h < atr).count();
+    let equal = historical_atrs.iter().filter(|&&h| (h - atr).abs() < 1e-9).count();
+    let percentile =
+        (below as f64 + equal as f64 / 2.0) / historical_atrs.len() as f64 * 100.0;
+
+    // Compare current ATR to ATR from ~10% of history ago to detect expansion/contraction.
+    let lookback = ((n / 10).max(5)).min(n - 14);
+    let expanding = calculate_atr_14(&candles[..n - lookback]).and_then(|past| {
+        if atr > past * 1.05 {
+            Some(true)
+        } else if atr < past * 0.952 {
+            Some(false)
+        } else {
+            None // stable — no suffix
+        }
+    });
+
+    let regime = if percentile < 20.0 {
+        VolatilityRegime::Compression
+    } else if percentile < 70.0 {
+        VolatilityRegime::Normal
+    } else if percentile < 90.0 {
+        VolatilityRegime::Elevated
+    } else {
+        VolatilityRegime::Extreme
+    };
+
+    let regime_confidence = if historical_atrs.len() >= 30 {
+        0.88_f32
+    } else if historical_atrs.len() >= 15 {
+        0.72
+    } else {
+        0.55
+    };
+
+    VolatilityState {
+        regime,
+        atr_percentile: Some(percentile),
+        expanding,
+        regime_confidence,
     }
 }
 
@@ -1027,6 +1112,109 @@ mod tests {
             .collect();
         assert!(!detect_absorption(&candles, &LiquidityWalls::default(), Some(5.0)));
     }
+
+    // ── P6 volatility regime ──────────────────────────────────────────────────────
+
+    fn make_range_candle(high: f64, low: f64) -> CandleData {
+        CandleData {
+            timestamp: 0,
+            open: (high + low) / 2.0,
+            high,
+            low,
+            close: (high + low) / 2.0,
+            volume: 1.0,
+            open_interest: None,
+            buy_volume: Decimal::from_f64(0.5).unwrap_or(Decimal::ZERO),
+            sell_volume: Decimal::from_f64(0.5).unwrap_or(Decimal::ZERO),
+            cvd: Decimal::ZERO,
+        }
+    }
+
+    #[test]
+    fn volatility_regime_unknown_with_too_few_candles() {
+        let candles: Vec<CandleData> = (0..20).map(|_| make_range_candle(110.0, 90.0)).collect();
+        let atr = calculate_atr_14(&candles);
+        let vol = compute_volatility_regime(&candles, atr);
+        assert!(matches!(vol.regime, VolatilityRegime::Unknown));
+        assert!(vol.atr_percentile.is_none());
+    }
+
+    #[test]
+    fn volatility_regime_normal_for_uniform_candles() {
+        // Uniform candles → ATR constant → percentile ~50% → Normal regime.
+        let candles: Vec<CandleData> = (0..100).map(|_| make_range_candle(110.0, 90.0)).collect();
+        let atr = calculate_atr_14(&candles);
+        let vol = compute_volatility_regime(&candles, atr);
+        assert!(matches!(vol.regime, VolatilityRegime::Normal));
+        assert!(vol.atr_percentile.is_some());
+    }
+
+    #[test]
+    fn volatility_regime_extreme_when_current_atr_highest() {
+        // Build candles with narrow range historically, then widen at the end.
+        let mut candles: Vec<CandleData> =
+            (0..80).map(|_| make_range_candle(105.0, 95.0)).collect();
+        // Add wide-range candles at the end (ATR spikes).
+        for _ in 0..20 {
+            candles.push(make_range_candle(150.0, 50.0));
+        }
+        let atr = calculate_atr_14(&candles);
+        let vol = compute_volatility_regime(&candles, atr);
+        // Current ATR should be well above historical — expect Elevated or Extreme.
+        assert!(
+            matches!(vol.regime, VolatilityRegime::Elevated | VolatilityRegime::Extreme),
+            "expected Elevated or Extreme, got {:?}",
+            vol.regime
+        );
+        assert!(vol.atr_percentile.unwrap() > 50.0);
+    }
+
+    #[test]
+    fn volatility_regime_compression_when_current_atr_lowest() {
+        // Wide range historically, then tight at end.
+        let mut candles: Vec<CandleData> =
+            (0..80).map(|_| make_range_candle(150.0, 50.0)).collect();
+        for _ in 0..20 {
+            candles.push(make_range_candle(101.0, 99.0));
+        }
+        let atr = calculate_atr_14(&candles);
+        let vol = compute_volatility_regime(&candles, atr);
+        // Current ATR is very low vs history — expect Compression or Normal.
+        assert!(
+            matches!(vol.regime, VolatilityRegime::Compression | VolatilityRegime::Normal),
+            "expected Compression or Normal, got {:?}",
+            vol.regime
+        );
+        assert!(vol.atr_percentile.unwrap() < 50.0);
+    }
+
+    #[test]
+    fn volatility_expanding_detected() {
+        // Start narrow, progressively widen — current ATR > past ATR.
+        let candles: Vec<CandleData> = (0..100u64)
+            .map(|i| {
+                let half_range = 5.0 + i as f64 * 0.5; // range grows over time
+                make_range_candle(100.0 + half_range, 100.0 - half_range)
+            })
+            .collect();
+        let atr = calculate_atr_14(&candles);
+        let vol = compute_volatility_regime(&candles, atr);
+        assert_eq!(vol.expanding, Some(true), "should detect expanding ATR");
+    }
+
+    #[test]
+    fn volatility_contracting_detected() {
+        // Start wide, progressively narrow.
+        let candles: Vec<CandleData> = (0..100u64)
+            .map(|i| {
+                let half_range = (55.0 - i as f64 * 0.5).max(1.0);
+                make_range_candle(100.0 + half_range, 100.0 - half_range)
+            })
+            .collect();
+        let atr = calculate_atr_14(&candles);
+        let vol = compute_volatility_regime(&candles, atr);
+        assert_eq!(vol.expanding, Some(false), "should detect contracting ATR");
+    }
 }
 
 fn compute_basis(spot_price: Option<f64>, perp_price: f64) -> BasisState {
@@ -1193,9 +1381,12 @@ pub fn build_unified_market_state(
     let price_trend_up = infer_price_trend(&candles);
     let cvd_slope = compute_cvd_slope(&candles);
     let oi_change_pct = calculate_open_interest_change_pct(&candles);
-    let (atr_14, rsi_divergence) = match cache {
+    let (atr_14, rsi_divergence, volatility) = match cache {
         Some(c) => c.get_or_refresh(&candles),
-        None => (calculate_atr_14(&candles), detect_rsi_divergence(&candles)),
+        None => {
+            let atr = calculate_atr_14(&candles);
+            (atr, detect_rsi_divergence(&candles), compute_volatility_regime(&candles, atr))
+        }
     };
     let vwap = calculate_vwap(&candles);
     let orderflow = compute_orderflow_state(&candles, &liquidity_walls, atr_14, cvd_seeded);
@@ -1250,5 +1441,6 @@ pub fn build_unified_market_state(
         global_oi,
         basis,
         orderflow,
+        volatility,
     }
 }
