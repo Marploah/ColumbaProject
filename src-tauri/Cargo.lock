@@ -558,6 +558,7 @@ dependencies = [
  "rust_decimal",
  "serde",
  "serde_json",
+ "smallvec",
  "ta",
  "tokio",
  "tokio-tungstenite",

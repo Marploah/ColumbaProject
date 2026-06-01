@@ -642,18 +642,26 @@ async fn poll_bybit_oi(
 ) {
     let mut symbol = symbol_rx.borrow().clone();
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+    let mut consecutive_errors: u32 = 0;
+    let mut circuit_open_until: Option<Instant> = None;
 
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                if circuit_open_until.map(|u| Instant::now() < u).unwrap_or(false) {
+                    continue;
+                }
+                circuit_open_until = None;
                 let sym = symbol.to_ascii_uppercase();
                 let url = format!(
                     "https://api.bybit.com/v5/market/open-interest?category=linear&symbol={sym}&intervalTime=5min&limit=1"
                 );
+                let mut failed = false;
                 match reqwest::get(&url).await {
                     Ok(resp) => {
                         match resp.json::<BybitOiResponse>().await {
                             Ok(data) if data.ret_code == 0 => {
+                                consecutive_errors = 0;
                                 if let Some(item) = data.result.list.first() {
                                     if let Ok(oi) = item.open_interest.parse::<f64>() {
                                         tracker.lock().await.update(oi);
@@ -663,21 +671,34 @@ async fn poll_bybit_oi(
                             Ok(data) => {
                                 tracker.lock().await.fail();
                                 warn!("Bybit OI returned retCode={}", data.ret_code);
+                                failed = true;
                             }
                             Err(e) => {
                                 tracker.lock().await.fail();
                                 warn!("failed to parse Bybit OI response for {sym}: {e:?}");
+                                failed = true;
                             }
                         }
                     }
                     Err(e) => {
                         tracker.lock().await.fail();
                         warn!("Bybit OI poll failed for {sym}: {e:?}");
+                        failed = true;
+                    }
+                }
+                if failed {
+                    consecutive_errors += 1;
+                    if consecutive_errors >= 10 {
+                        warn!("Bybit OI: circuit open after {consecutive_errors} consecutive failures; suppressing polls for 300s");
+                        circuit_open_until = Some(Instant::now() + Duration::from_secs(300));
+                        consecutive_errors = 0;
                     }
                 }
             }
             Ok(()) = symbol_rx.changed() => {
                 symbol = symbol_rx.borrow_and_update().clone();
+                consecutive_errors = 0;
+                circuit_open_until = None;
                 tracker.lock().await.reset();
             }
         }
@@ -690,10 +711,16 @@ async fn poll_okx_oi(
 ) {
     let mut symbol = symbol_rx.borrow().clone();
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+    let mut consecutive_errors: u32 = 0;
+    let mut circuit_open_until: Option<Instant> = None;
 
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                if circuit_open_until.map(|u| Instant::now() < u).unwrap_or(false) {
+                    continue;
+                }
+                circuit_open_until = None;
                 let Some(inst_id) = to_okx_symbol(&symbol) else {
                     warn!("cannot map symbol {} to OKX instId; skipping OI poll", symbol);
                     continue;
@@ -701,10 +728,12 @@ async fn poll_okx_oi(
                 let url = format!(
                     "https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId={inst_id}"
                 );
+                let mut failed = false;
                 match reqwest::get(&url).await {
                     Ok(resp) => {
                         match resp.json::<OkxOiResponse>().await {
                             Ok(data) if data.code == "0" => {
+                                consecutive_errors = 0;
                                 if let Some(item) = data.data.first() {
                                     if let Ok(oi) = item.oi.parse::<f64>() {
                                         tracker.lock().await.update(oi);
@@ -714,21 +743,34 @@ async fn poll_okx_oi(
                             Ok(data) => {
                                 tracker.lock().await.fail();
                                 warn!("OKX OI returned code={}", data.code);
+                                failed = true;
                             }
                             Err(e) => {
                                 tracker.lock().await.fail();
                                 warn!("failed to parse OKX OI response for {inst_id}: {e:?}");
+                                failed = true;
                             }
                         }
                     }
                     Err(e) => {
                         tracker.lock().await.fail();
                         warn!("OKX OI poll failed for {inst_id}: {e:?}");
+                        failed = true;
+                    }
+                }
+                if failed {
+                    consecutive_errors += 1;
+                    if consecutive_errors >= 10 {
+                        warn!("OKX OI: circuit open after {consecutive_errors} consecutive failures; suppressing polls for 300s");
+                        circuit_open_until = Some(Instant::now() + Duration::from_secs(300));
+                        consecutive_errors = 0;
                     }
                 }
             }
             Ok(()) = symbol_rx.changed() => {
                 symbol = symbol_rx.borrow_and_update().clone();
+                consecutive_errors = 0;
+                circuit_open_until = None;
                 tracker.lock().await.reset();
             }
         }
@@ -741,26 +783,50 @@ async fn poll_spot_price(
 ) {
     let mut symbol = symbol_rx.borrow().clone();
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+    let mut consecutive_errors: u32 = 0;
+    let mut circuit_open_until: Option<Instant> = None;
 
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                if circuit_open_until.map(|u| Instant::now() < u).unwrap_or(false) {
+                    continue;
+                }
+                circuit_open_until = None;
                 let sym = symbol.to_ascii_uppercase();
                 let url = format!("https://api.binance.com/api/v3/ticker/price?symbol={sym}");
+                let mut failed = false;
                 match reqwest::get(&url).await {
                     Ok(resp) => match resp.json::<SpotPriceResponse>().await {
                         Ok(data) => {
+                            consecutive_errors = 0;
                             if let Ok(price) = data.price.parse::<f64>() {
                                 *spot_price_arc.lock().await = Some(price);
                             }
                         }
-                        Err(e) => warn!("spot price parse error for {sym}: {e:?}"),
+                        Err(e) => {
+                            warn!("spot price parse error for {sym}: {e:?}");
+                            failed = true;
+                        }
                     },
-                    Err(e) => warn!("spot price poll failed for {sym}: {e:?}"),
+                    Err(e) => {
+                        warn!("spot price poll failed for {sym}: {e:?}");
+                        failed = true;
+                    }
+                }
+                if failed {
+                    consecutive_errors += 1;
+                    if consecutive_errors >= 10 {
+                        warn!("spot price: circuit open after {consecutive_errors} consecutive failures; suppressing polls for 300s");
+                        circuit_open_until = Some(Instant::now() + Duration::from_secs(300));
+                        consecutive_errors = 0;
+                    }
                 }
             }
             Ok(()) = symbol_rx.changed() => {
                 symbol = symbol_rx.borrow_and_update().clone();
+                consecutive_errors = 0;
+                circuit_open_until = None;
                 *spot_price_arc.lock().await = None;
             }
         }
@@ -1692,7 +1758,8 @@ async fn process_trade_deltas(
                     .unwrap_or(true);
 
                 if should_broadcast {
-                    last_broadcast = Some(Instant::now());
+                    let t0 = Instant::now();
+                    last_broadcast = Some(t0);
                     let symbol = market.read().await.symbol.clone();
                     let biases = tf_biases.lock().await.clone();
                     let oi_real = *oi_is_real.lock().await;
@@ -1725,9 +1792,14 @@ async fn process_trade_deltas(
                         spot,
                         fg,
                     );
-                    *market.write().await = next_state.clone();
-                    if let Ok(json) = serde_json::to_string(&next_state) {
-                        let _ = snapshot_tx.send(json);
+                    let json = serde_json::to_string(&next_state).ok();
+                    *market.write().await = next_state;
+                    if let Some(j) = json {
+                        let _ = snapshot_tx.send(j);
+                    }
+                    let elapsed = t0.elapsed();
+                    if elapsed.as_millis() > 20 {
+                        warn!("broadcast cycle slow: {}ms", elapsed.as_millis());
                     }
                 }
             }

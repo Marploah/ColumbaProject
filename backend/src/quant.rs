@@ -6,6 +6,7 @@ use crate::state::volatility::{VolatilityRegime, VolatilityState};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use std::time::{SystemTime, UNIX_EPOCH};
 use ta::indicators::{AverageTrueRange, RelativeStrengthIndex};
 use ta::{DataItem, Next};
@@ -193,13 +194,10 @@ pub fn compute_cvd_divergence_threshold(candles: &[CandleData]) -> f64 {
         return 5.0;
     }
     let slice = &candles[candles.len() - window..];
-    let cvd_vals: Vec<f64> = slice
-        .iter()
-        .map(|c| c.cvd.to_f64().unwrap_or(0.0))
-        .collect();
-    let mean = cvd_vals.iter().sum::<f64>() / cvd_vals.len() as f64;
-    let variance = cvd_vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
-        / cvd_vals.len() as f64;
+    let n = slice.len() as f64;
+    let mean = slice.iter().map(|c| c.cvd.to_f64().unwrap_or(0.0)).sum::<f64>() / n;
+    let variance =
+        slice.iter().map(|c| (c.cvd.to_f64().unwrap_or(0.0) - mean).powi(2)).sum::<f64>() / n;
     // sigma / window converts CVD magnitude to per-candle slope units; floor at 1.0
     (variance.sqrt() / window as f64).max(1.0)
 }
@@ -312,7 +310,7 @@ pub fn compute_volatility_regime(candles: &[CandleData], current_atr: Option<f64
 
     // Sample ATR at evenly-spaced endpoints using all prior candles for EMA warmup.
     let step = ((n - 14) / 50).max(1);
-    let historical_atrs: Vec<f64> = (14..n)
+    let historical_atrs: SmallVec<[f64; 52]> = (14..n)
         .step_by(step)
         .filter_map(|end| calculate_atr_14(&candles[..end]))
         .collect();
@@ -388,29 +386,28 @@ pub fn infer_price_trend(candles: &[CandleData]) -> bool {
 }
 
 pub fn calculate_open_interest_change_pct(candles: &[CandleData]) -> f64 {
-    let values: Vec<f64> = candles
-        .iter()
-        .filter_map(|candle| candle.open_interest)
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .collect();
-
-    if values.len() < 2 {
+    let mut first = None;
+    let mut last = None;
+    let mut count = 0usize;
+    for oi in candles.iter().filter_map(|c| c.open_interest.filter(|v| v.is_finite() && *v > 0.0))
+    {
+        if first.is_none() {
+            first = Some(oi);
+        }
+        last = Some(oi);
+        count += 1;
+    }
+    if count < 2 {
         return 0.0;
     }
-
-    let first = values.first().copied().unwrap_or_default();
-    let last = values.last().copied().unwrap_or_default();
-
-    if first.abs() < f64::EPSILON {
-        0.0
-    } else {
-        ((last - first) / first) * 100.0
-    }
+    let first = first.unwrap_or_default();
+    let last = last.unwrap_or_default();
+    if first.abs() < f64::EPSILON { 0.0 } else { ((last - first) / first) * 100.0 }
 }
 
-fn compute_rsi_series(candles: &[CandleData], period: usize) -> Vec<Option<f64>> {
+fn compute_rsi_series(candles: &[CandleData], period: usize) -> SmallVec<[Option<f64>; 30]> {
     let Ok(mut rsi) = RelativeStrengthIndex::new(period) else {
-        return vec![None; candles.len()];
+        return std::iter::repeat(None).take(candles.len()).collect();
     };
     candles
         .iter()
@@ -440,7 +437,7 @@ pub fn detect_rsi_divergence(candles: &[CandleData]) -> String {
     let slice = &candles[candles.len() - window..];
     let rsi_vals = compute_rsi_series(slice, 14);
 
-    let pairs: Vec<(f64, f64)> = slice
+    let pairs: SmallVec<[(f64, f64); 30]> = slice
         .iter()
         .zip(rsi_vals.iter())
         .filter_map(|(c, r)| r.map(|rv| (c.close, rv)))
