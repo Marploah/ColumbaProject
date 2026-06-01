@@ -21,6 +21,60 @@ export interface CandlePayload {
   open_interest?: number | null;
 }
 
+export interface LiquidationState {
+  long_1m: number;
+  short_1m: number;
+  long_5m: number;
+  short_5m: number;
+  imbalance_ratio: number;
+  velocity: number;
+  feed_healthy: boolean;
+}
+
+export interface ExchangeOiEntry {
+  oi: number | null;
+  change_pct: number | null;
+  healthy: boolean;
+}
+
+export interface GlobalOIState {
+  binance: ExchangeOiEntry;
+  bybit: ExchangeOiEntry;
+  okx: ExchangeOiEntry;
+  divergence_score: number;
+  divergence_label: string;
+}
+
+export interface BasisState {
+  basis_pct: number | null;
+  regime: string;
+  feed_healthy: boolean;
+}
+
+export interface OrderflowState {
+  current_delta: number;
+  delta_momentum: number;
+  buy_pressure_pct: number;
+  absorption_detected: boolean;
+  sweep_detected: boolean;
+  sweep_direction: string | null;
+  feed_healthy: boolean;
+}
+
+export interface VolatilityState {
+  regime: string;
+  atr_percentile: number | null;
+  expanding: boolean | null;
+  regime_confidence: number;
+}
+
+export interface FearGreedState {
+  value: number;
+  classification: string;
+  timestamp: number;
+  feed_healthy: boolean;
+}
+
 export interface MarketSnapshot {
   symbol: string;
   last_price: number;
@@ -29,6 +83,16 @@ export interface MarketSnapshot {
   volatility_upper_limit?: number | null;
   volatility_lower_limit?: number | null;
   cvd_seeded?: boolean;
+  funding_rate?: number | null;
+  funding_hours_to_settlement?: number;
+  long_short_indicator?: string;
+  vwap?: number | null;
+  liquidations?: LiquidationState;
+  global_oi?: GlobalOIState;
+  basis?: BasisState;
+  orderflow?: OrderflowState;
+  volatility?: VolatilityState;
+  sentiment?: FearGreedState;
 }
 
 export interface TradePlanPayload {

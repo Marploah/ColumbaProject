@@ -92,7 +92,8 @@ textarea {
   display: grid;
   gap: 6px;
   overflow: auto;
-  min-height: 0;
+  min-height: 80px;
+  flex: 1 1 auto;
   padding-right: 2px;
 }
 
@@ -539,6 +540,77 @@ textarea {
 
 .dl-btn:hover { background: #234870; }
 .dl-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* ── Intelligence panel ─────────────────────────────────── */
+.intel-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.intel-panel .eyebrow {
+  margin: 0 0 4px;
+}
+
+.intel-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 22px;
+}
+
+.intel-label {
+  flex-shrink: 0;
+  color: #5a7088;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  width: 48px;
+}
+
+.intel-val {
+  flex: 1;
+  text-align: right;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.liq-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+}
+
+.intel-sep {
+  color: #3a4a5a;
+  font-size: 11px;
+}
+
+/* Regime badge colors */
+.regime-badge { font-weight: 600; }
+.regime-compression { color: #a78bfa; }
+.regime-normal      { color: #20bf75; }
+.regime-elevated    { color: #f97316; }
+.regime-extreme     { color: #ef476f; }
+.regime-unknown     { color: #5a7088; }
+
+/* Fear & Greed colors */
+.fg-extreme-fear { color: #ef476f; }
+.fg-fear         { color: #f97316; }
+.fg-neutral      { color: #f6c85f; }
+.fg-greed        { color: #20bf75; }
+.fg-extreme-greed { color: #1ede8e; }
+
+/* Generic semantic colors */
+.bullish-val { color: #20bf75; }
+.bearish-val { color: #ef476f; }
+.neutral-val { color: #f6c85f; }
 
 /* ── Typewriter cursor ───────────────────────────────────── */
 .cursor-blink {

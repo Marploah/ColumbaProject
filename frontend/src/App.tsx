@@ -25,6 +25,27 @@ interface DownloadProgress {
   total_bytes: number;
 }
 import { ChartManager, DEFAULT_INDICATOR_CONFIG, IndicatorConfig, MarketSnapshot, TradePlanPayload } from './ChartManager';
+
+function fmtUsd(v: number): string {
+  if (v >= 1_000_000) return `$${(v / 1_000_000).toFixed(1)}M`;
+  if (v >= 1_000) return `$${(v / 1_000).toFixed(0)}K`;
+  return `$${v.toFixed(0)}`;
+}
+
+function regimeClass(regime: string): string {
+  switch (regime) {
+    case 'Compression': return 'regime-compression';
+    case 'Normal':      return 'regime-normal';
+    case 'Elevated':    return 'regime-elevated';
+    case 'Extreme':     return 'regime-extreme';
+    default:            return 'regime-unknown';
+  }
+}
+
+function fgClass(classification: string): string {
+  const key = classification.toLowerCase().replace(/ /g, '-');
+  return `fg-${key}`;
+}
 import { SimulationEngine } from './SimulationEngine';
 
 interface ExchangeSymbol {
@@ -504,6 +525,90 @@ export default function App() {
               <strong className={status.toLowerCase()}>{status}</strong>
             </div>
           ))}
+        </section>
+
+        <section className="intel-panel">
+          <p className="eyebrow">Intelligence</p>
+
+          {snapshot?.volatility && (
+            <div className="intel-row">
+              <span className="intel-label">Regime</span>
+              <span className={`intel-val regime-badge ${regimeClass(snapshot.volatility.regime)}`}>
+                {snapshot.volatility.regime}
+                {snapshot.volatility.atr_percentile != null && (
+                  <> · {Math.round(snapshot.volatility.atr_percentile)}p</>
+                )}
+                {snapshot.volatility.expanding === true && ' ↑'}
+                {snapshot.volatility.expanding === false && ' ↓'}
+              </span>
+            </div>
+          )}
+
+          {snapshot?.sentiment?.feed_healthy && (
+            <div className="intel-row">
+              <span className="intel-label">F&amp;G</span>
+              <span className={`intel-val ${fgClass(snapshot.sentiment.classification)}`}>
+                {snapshot.sentiment.value} · {snapshot.sentiment.classification}
+              </span>
+            </div>
+          )}
+
+          {snapshot?.funding_rate != null && (
+            <div className="intel-row">
+              <span className="intel-label">Funding</span>
+              <span className={`intel-val ${snapshot.funding_rate > 0.001 ? 'bearish-val' : snapshot.funding_rate < -0.001 ? 'bullish-val' : 'neutral-val'}`}>
+                {snapshot.funding_rate >= 0 ? '+' : ''}{(snapshot.funding_rate * 100).toFixed(4)}%
+              </span>
+            </div>
+          )}
+
+          {snapshot?.basis?.feed_healthy && snapshot.basis.basis_pct != null && (
+            <div className="intel-row">
+              <span className="intel-label">Basis</span>
+              <span className={`intel-val ${snapshot.basis.basis_pct > 0.05 ? 'bullish-val' : snapshot.basis.basis_pct < -0.05 ? 'bearish-val' : 'neutral-val'}`}>
+                {snapshot.basis.basis_pct >= 0 ? '+' : ''}{snapshot.basis.basis_pct.toFixed(3)}%
+              </span>
+            </div>
+          )}
+
+          {snapshot?.orderflow && (
+            <div className="intel-row">
+              <span className="intel-label">Flow</span>
+              <span className="intel-val">
+                {snapshot.orderflow.sweep_detected ? (
+                  <span className={snapshot.orderflow.sweep_direction === 'ask' ? 'bearish-val' : 'bullish-val'}>
+                    {snapshot.orderflow.sweep_direction === 'ask' ? 'Bear Sweep' : 'Bull Sweep'}
+                  </span>
+                ) : snapshot.orderflow.absorption_detected ? (
+                  <span className="neutral-val">Absorption</span>
+                ) : (
+                  <span className={snapshot.orderflow.buy_pressure_pct > 0.55 ? 'bullish-val' : snapshot.orderflow.buy_pressure_pct < 0.45 ? 'bearish-val' : 'neutral-val'}>
+                    {Math.round(snapshot.orderflow.buy_pressure_pct * 100)}% buy
+                  </span>
+                )}
+              </span>
+            </div>
+          )}
+
+          {snapshot?.liquidations?.feed_healthy && (snapshot.liquidations.long_5m > 0 || snapshot.liquidations.short_5m > 0) && (
+            <div className="intel-row">
+              <span className="intel-label">Liq 5m</span>
+              <span className="intel-val liq-row">
+                <span className="bullish-val">{fmtUsd(snapshot.liquidations.long_5m)}</span>
+                <span className="intel-sep">·</span>
+                <span className="bearish-val">{fmtUsd(snapshot.liquidations.short_5m)}</span>
+              </span>
+            </div>
+          )}
+
+          {snapshot?.global_oi && snapshot.global_oi.divergence_score > 0.3 && (
+            <div className="intel-row">
+              <span className="intel-label">OI Div</span>
+              <span className={`intel-val ${snapshot.global_oi.divergence_score > 0.6 ? 'bearish-val' : 'neutral-val'}`}>
+                {snapshot.global_oi.divergence_label}
+              </span>
+            </div>
+          )}
         </section>
       </aside>
 
