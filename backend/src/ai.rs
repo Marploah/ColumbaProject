@@ -119,6 +119,22 @@ impl AiBroker {
                 .context("invalid API key header")?,
         );
 
+        // Qwen3 models output to reasoning_content (not content) when thinking mode is on.
+        // /nothink in the system message is the reliable way to disable it for local llama-server.
+        let messages = if matches!(self.provider, Provider::LlamaCpp) {
+            messages
+                .into_iter()
+                .map(|mut m| {
+                    if m.role == "system" && !m.content.starts_with("/nothink") {
+                        m.content = format!("/nothink\n\n{}", m.content);
+                    }
+                    m
+                })
+                .collect::<Vec<_>>()
+        } else {
+            messages
+        };
+
         let response = self
             .http
             .post(format!(
@@ -134,7 +150,6 @@ impl AiBroker {
                     "messages": messages,
                 });
                 if matches!(self.provider, Provider::LlamaCpp) {
-                    body["chat_template_kwargs"] = json!({ "enable_thinking": false });
                     body["grammar"] = json!(TRADE_PLAN_GRAMMAR);
                 }
                 body
@@ -237,9 +252,16 @@ fn format_market_brief(state: &UnifiedMarketState) -> String {
         let atr_pct = atr / state.last_price * 100.0;
         let upper = state.volatility_upper_limit.unwrap_or(f64::NAN);
         let lower = state.volatility_lower_limit.unwrap_or(f64::NAN);
+        let risk_pts = atr * 0.5;
+        let reward_pts = risk_pts * 1.6;
         lines.push(format!(
             "ATR-14: {:.4} ({:.2}% of price) | 1.5× ATR band: [{:.4}, {:.4}]",
             atr, atr_pct, lower, upper,
+        ));
+        lines.push(format!(
+            "PLAN CONSTRAINT: take_profit must be ≥1.5× farther from entry than stop_loss. \
+             Suggested sizing at current ATR — risk: {:.2} pts, reward: {:.2} pts (1.6:1 R:R).",
+            risk_pts, reward_pts,
         ));
     }
 
