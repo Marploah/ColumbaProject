@@ -11,7 +11,7 @@ mod trade_log;
 use ai::{AiBroker, ChatMessage, TradePlan};
 use anyhow::{Context, Result};
 use liquidations::{parse_force_order, LiquidationAggregator};
-use state::derivatives::{ExchangeOiEntry, GlobalOIState};
+use state::derivatives::{ExchangeOiEntry, GlobalOIState, LiquidationState};
 use state::liquidity::WallTracker;
 use state::sentiment::FearGreedState;
 use axum::{
@@ -21,7 +21,7 @@ use axum::{
     },
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, patch, post, put},
+    routing::{get, patch, post},
     Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -35,13 +35,12 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::{
     env,
-    net::SocketAddr,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use axum::http::{header, HeaderValue, Method};
-use std::sync::RwLock as StdRwLock;
 use tokio::sync::{broadcast, mpsc, watch, Mutex, RwLock, Semaphore};
 use tokio_tungstenite::{
     connect_async,
@@ -867,27 +866,14 @@ pub async fn run() -> Result<()> {
         AgentTarget::Cloud(model) => AiBroker::openai(api_key, model),
     };
 
-    let (initial_candles, seed_oi_is_real) = match fetch_klines_with_oi(&symbol, "1m").await {
-        Ok(result) => result,
-        Err(err) => {
-            warn!("failed to seed recent Binance klines: {err:?}");
-            (Vec::new(), false)
-        }
-    };
-
-    let (initial_tf_biases, initial_depth_result) =
-        tokio::join!(fetch_tf_biases(&symbol), fetch_depth(&symbol));
-    let tf_biases = Arc::new(Mutex::new(initial_tf_biases.clone()));
+    // Start with empty defaults — all three network fetches run concurrently in a background
+    // task so Axum starts immediately instead of waiting 5-7 s for Binance REST responses.
+    let tf_biases = Arc::new(Mutex::new(TfBiases::default()));
     let binance_oi_tracker: Arc<Mutex<OiTracker>> = Arc::new(Mutex::new(OiTracker::default()));
     let bybit_oi_tracker: Arc<Mutex<OiTracker>> = Arc::new(Mutex::new(OiTracker::default()));
     let okx_oi_tracker: Arc<Mutex<OiTracker>> = Arc::new(Mutex::new(OiTracker::default()));
-    let oi_is_real_arc: Arc<Mutex<bool>> = Arc::new(Mutex::new(seed_oi_is_real));
-
-    // Seed wall tracker from the initial depth snapshot so startup state has real wall data.
+    let oi_is_real_arc: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     let wall_tracker_arc: Arc<Mutex<WallTracker>> = Arc::new(Mutex::new(WallTracker::default()));
-    if let Ok(depth) = initial_depth_result {
-        wall_tracker_arc.lock().await.update(&depth.bids, &depth.asks, Instant::now());
-    }
     let (initial_walls, initial_liquidity_analytics) = {
         let t = wall_tracker_arc.lock().await;
         (t.snapshot_walls(), t.snapshot_analytics())
@@ -903,18 +889,18 @@ pub async fn run() -> Result<()> {
 
     let initial_market = build_unified_market_state(
         symbol.to_uppercase(),
-        initial_candles,
+        vec![],
         initial_walls,
         initial_liquidity_analytics,
-        Some(initial_tf_biases),
-        seed_oi_is_real,
+        None,
+        false,
         None,
         None,
         false,
-        liquidation_aggregator_arc.lock().await.snapshot(),
+        LiquidationState::default(),
         GlobalOIState::default(),
-        None, // spot price not yet polled
-        FearGreedState::default(), // fear/greed not yet polled
+        None,
+        FearGreedState::default(),
     );
 
     let (symbol_tx, symbol_rx) = watch::channel(symbol.clone());
@@ -924,8 +910,11 @@ pub async fn run() -> Result<()> {
     let (price_tx, _) = broadcast::channel::<f64>(512);
     let price_tx = Arc::new(price_tx);
 
-    let db_path = env::var("COLUMBA_TRADE_LOG")
-        .unwrap_or_else(|_| "columba_trades.db".to_string());
+    let db_path = env::var("COLUMBA_TRADE_LOG").unwrap_or_else(|_| {
+        env::var("COLUMBA_STORAGE_DIR")
+            .map(|dir| std::path::Path::new(&dir).join("columba_trades.db").display().to_string())
+            .unwrap_or_else(|_| "columba_trades.db".to_string())
+    });
     let trade_log = match TradeLog::open(std::path::Path::new(&db_path)) {
         Ok(log) => log,
         Err(e) => {
@@ -962,15 +951,59 @@ pub async fn run() -> Result<()> {
     let walls_symbol_rx = symbol_rx.clone();
     let fr_symbol_rx = symbol_rx.clone();
     let tf_symbol_rx = symbol_rx.clone();
-    // Seed the trade processor immediately so it starts with the full 1500-candle
-    // history instead of an empty buffer. Without this, the first WS broadcast
-    // would overwrite state.market with a single live candle.
-    let seed_candles = state.market.read().await.candles.clone();
-    state
-        .trade_tx
-        .send(TradeMessage::ResetSymbol { candles: seed_candles })
-        .await
-        .ok();
+
+    // Background seeding: fetch klines + TF biases + depth concurrently, write to state,
+    // then send ResetSymbol so the trade processor seeds its local candle buffer.
+    // Axum starts below without waiting for this — eliminates "connection refused" on fast launch.
+    {
+        let seed_market = Arc::clone(&state.market);
+        let seed_tf = Arc::clone(&state.tf_biases);
+        let seed_wall = Arc::clone(&wall_tracker_arc);
+        let seed_oi = Arc::clone(&oi_is_real_arc);
+        let seed_tx = trade_tx.clone();
+        let seed_sym = symbol.clone();
+        tokio::spawn(async move {
+            let (kline_result, fresh_biases, depth_result) = tokio::join!(
+                fetch_klines_with_oi(&seed_sym, "1m"),
+                fetch_tf_biases(&seed_sym),
+                fetch_depth(&seed_sym)
+            );
+            let (candles, oi_real) = match kline_result {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("initial kline seed failed: {e:?}");
+                    (vec![], false)
+                }
+            };
+            *seed_tf.lock().await = fresh_biases;
+            *seed_oi.lock().await = oi_real;
+            if let Ok(depth) = depth_result {
+                seed_wall.lock().await.update(&depth.bids, &depth.asks, Instant::now());
+            }
+            let (walls, liquidity_analytics) = {
+                let t = seed_wall.lock().await;
+                (t.snapshot_walls(), t.snapshot_analytics())
+            };
+            let biases = seed_tf.lock().await.clone();
+            let seeded_market = build_unified_market_state(
+                seed_sym.to_uppercase(),
+                candles.clone(),
+                walls,
+                liquidity_analytics,
+                Some(biases),
+                oi_real,
+                None,
+                None,
+                false,
+                LiquidationState::default(),
+                GlobalOIState::default(),
+                None,
+                FearGreedState::default(),
+            );
+            *seed_market.write().await = seeded_market;
+            seed_tx.send(TradeMessage::ResetSymbol { candles }).await.ok();
+        });
+    }
 
     let liq_symbol_rx = symbol_rx.clone();
     let spot_symbol_rx = symbol_rx.clone();
@@ -1252,9 +1285,25 @@ async fn set_interval(
 }
 
 fn is_local_url(url: &str) -> bool {
-    url.starts_with("http://127.0.0.1:")
-        || url.starts_with("http://localhost:")
-        || url.starts_with("http://[::1]:")
+    let parsed = match url::Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+
+    if parsed.scheme() != "http" {
+        return false;
+    }
+
+    if parsed.username() != "" || parsed.password().is_some() {
+        return false;
+    }
+
+    match parsed.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(addr)) => addr == Ipv4Addr::LOCALHOST,
+        Some(url::Host::Ipv6(addr)) => addr == Ipv6Addr::LOCALHOST,
+        None => false,
+    }
 }
 
 async fn analyze(
@@ -1277,7 +1326,7 @@ async fn analyze(
     let target = broker
         .request_trade_plan(request.messages, &market)
         .await
-        .map_err(internal_error)?;
+        .map_err(analyze_error)?;
 
     let trade_log_id = match state.trade_log.insert(
         &market.symbol,
@@ -1339,6 +1388,21 @@ async fn patch_trade_outcome(
 fn internal_error(err: anyhow::Error) -> (axum::http::StatusCode, String) {
     error!("{err:?}");
     (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string())
+}
+
+fn analyze_error(err: anyhow::Error) -> (axum::http::StatusCode, String) {
+    error!("{err:?}");
+    let msg = err.to_string();
+    if msg.contains("plan rejected") {
+        return (
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            format!("Trade plan rejected by risk rules: {msg}"),
+        );
+    }
+    (
+        axum::http::StatusCode::BAD_GATEWAY,
+        format!("LLM request failed: {msg}"),
+    )
 }
 
 async fn ws_handler(

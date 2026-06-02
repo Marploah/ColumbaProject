@@ -259,6 +259,122 @@ textarea {
   min-height: 0;
 }
 
+.panel-tabs {
+  display: flex;
+  gap: 10px;
+  padding: 6px 0 2px;
+}
+
+.panel-tab {
+  flex: 1 1 0;
+  min-height: 40px;
+  border: 1px solid #2d3848;
+  border-radius: 10px;
+  color: #a0afc2;
+  background: #13202e;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
+}
+
+.panel-tab:hover {
+  color: #eef4fb;
+  border-color: #5076b3;
+  background: #17273a;
+}
+
+.panel-tab.active {
+  color: #f7fbff;
+  border-color: #4d96ff;
+  background: linear-gradient(180deg, #23406a 0%, #1b2f4f 100%);
+  box-shadow: 0 0 0 1px rgba(77, 150, 255, 0.08) inset;
+}
+
+.panel-tab-icon {
+  font-size: 10px;
+  line-height: 1;
+  color: #80a8ff;
+}
+
+.tutorial-shell {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  flex-direction: column;
+  gap: 12px;
+  overflow: hidden;
+}
+
+.tutorial-kicker {
+  margin: 0;
+  color: #8fa3bc;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.tutorial-content {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.tutorial-content h1,
+.tutorial-content h2,
+.tutorial-content h3 {
+  margin: 0 0 10px;
+  line-height: 1.15;
+}
+
+.tutorial-content h1 {
+  font-size: 18px;
+}
+
+.tutorial-content h2 {
+  margin-top: 18px;
+  font-size: 15px;
+  color: #dbe6f4;
+}
+
+.tutorial-content h3 {
+  margin-top: 14px;
+  font-size: 13px;
+  color: #b9c7d8;
+}
+
+.tutorial-content p,
+.tutorial-content ul,
+.tutorial-content ol {
+  margin: 0 0 12px;
+  color: #d7dde5;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.tutorial-content ul,
+.tutorial-content ol {
+  padding-left: 20px;
+}
+
+.tutorial-content li {
+  margin: 0 0 6px;
+}
+
+.tutorial-content code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: #0d1520;
+  color: #f1f5f9;
+  font-size: 12px;
+}
+
 .message {
   padding: 10px;
   border-radius: 6px;
@@ -523,6 +639,7 @@ textarea {
 .model-entry .model-size { font-size: 11px; color: #5a6e85; }
 .model-entry .model-status.ok { color: #3ecf6a; font-size: 12px; }
 .model-entry .model-status.downloading { color: #f0b429; font-size: 12px; font-variant-numeric: tabular-nums; }
+.model-entry .model-status.error { color: #ef476f; font-size: 12px; }
 .model-entry .dl-progress { grid-column: 1 / -1; width: 100%; height: 4px; accent-color: #3b82f6; }
 
 .dl-btn {
@@ -540,6 +657,11 @@ textarea {
 
 .dl-btn:hover { background: #234870; }
 .dl-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.setup-warning {
+  margin: 0 0 16px;
+  font-size: 12px;
+  color: #f28b82;
+}
 
 /* ── Intelligence panel ─────────────────────────────────── */
 .intel-panel {

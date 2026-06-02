@@ -1,7 +1,8 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { Camera, Cpu, Download, Send, SlidersHorizontal } from 'lucide-react';
+import { BookOpen, Camera, Cpu, Download, Send, SlidersHorizontal } from 'lucide-react';
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import tutorialMarkdown from './content/tutorials.md?raw';
 
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
@@ -45,6 +46,99 @@ function regimeClass(regime: string): string {
 function fgClass(classification: string): string {
   const key = classification.toLowerCase().replace(/ /g, '-');
   return `fg-${key}`;
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function renderInlineMarkdown(text: string): string {
+  return escapeHtml(text)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+}
+
+function markdownToHtml(markdown: string): string {
+  const lines = markdown.replace(/\r\n/g, '\n').trim().split('\n');
+  const blocks: string[] = [];
+  let paragraph: string[] = [];
+  let listType: 'ul' | 'ol' | null = null;
+
+  const flushParagraph = () => {
+    if (!paragraph.length) return;
+    blocks.push(`<p>${renderInlineMarkdown(paragraph.join(' ').trim())}</p>`);
+    paragraph = [];
+  };
+
+  const closeList = () => {
+    if (!listType) return;
+    blocks.push(`</${listType}>`);
+    listType = null;
+  };
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    if (!trimmed) {
+      flushParagraph();
+      closeList();
+      continue;
+    }
+
+    if (trimmed.startsWith('### ')) {
+      flushParagraph();
+      closeList();
+      blocks.push(`<h3>${renderInlineMarkdown(trimmed.slice(4))}</h3>`);
+      continue;
+    }
+
+    if (trimmed.startsWith('## ')) {
+      flushParagraph();
+      closeList();
+      blocks.push(`<h2>${renderInlineMarkdown(trimmed.slice(3))}</h2>`);
+      continue;
+    }
+
+    if (trimmed.startsWith('# ')) {
+      flushParagraph();
+      closeList();
+      blocks.push(`<h1>${renderInlineMarkdown(trimmed.slice(2))}</h1>`);
+      continue;
+    }
+
+    if (trimmed.startsWith('- ')) {
+      flushParagraph();
+      if (listType !== 'ul') {
+        closeList();
+        blocks.push('<ul>');
+        listType = 'ul';
+      }
+      blocks.push(`<li>${renderInlineMarkdown(trimmed.slice(2))}</li>`);
+      continue;
+    }
+
+    const orderedMatch = trimmed.match(/^\d+\.\s+(.*)$/);
+    if (orderedMatch) {
+      flushParagraph();
+      if (listType !== 'ol') {
+        closeList();
+        blocks.push('<ol>');
+        listType = 'ol';
+      }
+      blocks.push(`<li>${renderInlineMarkdown(orderedMatch[1])}</li>`);
+      continue;
+    }
+
+    paragraph.push(trimmed);
+  }
+
+  flushParagraph();
+  closeList();
+
+  return blocks.join('');
 }
 import { SimulationEngine } from './SimulationEngine';
 
@@ -115,6 +209,7 @@ export default function App() {
   const toastIdRef = useRef(0);
   const tradeLogIdRef = useRef<number | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [rightPanelTab, setRightPanelTab] = useState<'chat' | 'tutorials'>('chat');
   const [positionSizePct, setPositionSizePct] = useState(1.0);
   const [leverage, setLeverage] = useState(1);
   const [llamaServerUrl, setLlamaServerUrl] = useState(
@@ -131,6 +226,7 @@ export default function App() {
     }
   });
   const indicatorConfigRef = useRef(indicatorConfig);
+  const tutorialHtml = useMemo(() => markdownToHtml(tutorialMarkdown), []);
 
   const addToast = useRef((text: string) => {
     const id = ++toastIdRef.current;
@@ -416,13 +512,18 @@ export default function App() {
   async function downloadModel(entry: ModelEntry) {
     try {
       await invoke('download_missing_model', { name: entry.name, url: entry.url });
+      const updatedModels = (setupStatus?.models ?? []).map((m) =>
+        m.name === entry.name ? { ...m, present: true } : m,
+      );
+      const allReady = updatedModels.every((m) => m.present);
       setSetupStatus((prev) => {
         if (!prev) return prev;
-        const updated = prev.models.map((m) =>
-          m.name === entry.name ? { ...m, present: true } : m,
-        );
-        return { ...prev, models: updated, ready: updated.every((m) => m.present) };
+        return { ...prev, models: updatedModels, ready: allReady };
       });
+      if (allReady) {
+        // All models present — launch llama-server without waiting for a restart.
+        invoke('start_llama_server').catch(() => {});
+      }
     } catch (e) {
       addToast(`Download failed: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -435,6 +536,7 @@ export default function App() {
       mid_range: 'Mid-range (CPU / Vulkan)',
       high_end: 'High-end (CUDA / Vulkan)',
     };
+    const hasMissingUrls = setupStatus.models.some((m) => !m.present && !m.url);
     return (
       <main className="setup-screen">
         <div className="setup-card">
@@ -448,6 +550,11 @@ export default function App() {
           <p className="setup-hint">
             These models must be downloaded before Columba can run local inference.
           </p>
+          {hasMissingUrls && (
+            <p className="setup-warning">
+              The bundled model manifest could not be resolved, so download links are unavailable.
+            </p>
+          )}
           <ul className="model-list">
             {setupStatus.models.map((m) => {
               const prog = downloadingModels[m.name];
@@ -464,15 +571,16 @@ export default function App() {
                     <span className="model-status downloading">
                       {pct != null ? `${pct}%` : 'Connecting…'}
                     </span>
-                  ) : (
+                  ) : m.url ? (
                     <button
                       className="dl-btn"
                       type="button"
                       onClick={() => downloadModel(m)}
-                      disabled={!m.url}
                     >
                       <Download size={14} /> Download
                     </button>
+                  ) : (
+                    <span className="model-status error">Unavailable</span>
                   )}
                   {prog && prog.total_bytes > 0 && (
                     <progress
@@ -648,7 +756,7 @@ export default function App() {
         <header className="panel-header">
           <div>
             <p className="eyebrow">LLM desk</p>
-            <h2>Execution Chat</h2>
+            <h2>{rightPanelTab === 'chat' ? 'Execution Chat' : 'Tutorials'}</h2>
           </div>
           <button
             className="icon-button"
@@ -660,72 +768,109 @@ export default function App() {
           </button>
         </header>
 
-        <label className="select-label">
-          Model routing
-          <select value={modelMode} onChange={(event) => setModelMode(event.target.value)}>
-            <option value="Auto">Auto</option>
-            <option value="ForceLocal">Force local</option>
-            <option value="ForceCloud">Force cloud</option>
-          </select>
-        </label>
-
-        <section className="chat-log">
-          {messages
-            .filter((message) => message.role !== 'system')
-            .slice(-7)
-            .map((message, index, arr) => {
-              const isLastAssistant =
-                message.role === 'assistant' && index === arr.length - 1;
-              const content =
-                isLastAssistant && streamingThesis
-                  ? streamingThesis.displayed
-                  : message.content;
-              return (
-                <div className={`message ${message.role}`} key={`${message.role}-${index}`}>
-                  {content}
-                  {isLastAssistant && streamingThesis && (
-                    <span className="cursor-blink">▋</span>
-                  )}
-                </div>
-              );
-            })}
-        </section>
-
-        <form className="chat-form" onSubmit={submitAnalysis}>
-          <textarea
-            value={prompt}
-            onChange={(event) => setPrompt(event.target.value)}
-            placeholder="Request a trade plan from current CVD, OI, ATR, and liquidity context."
-          />
-          <div className="position-sizing-row">
-            <label>
-              Risk %
-              <input
-                type="number"
-                min={0.1}
-                max={100}
-                step={0.1}
-                value={positionSizePct}
-                onChange={(e) => setPositionSizePct(parseFloat(e.target.value) || 1)}
-              />
-            </label>
-            <label>
-              Leverage
-              <input
-                type="number"
-                min={1}
-                max={125}
-                step={1}
-                value={leverage}
-                onChange={(e) => setLeverage(parseInt(e.target.value, 10) || 1)}
-              />
-            </label>
-          </div>
-          <button disabled={isAnalyzing} type="submit">
-            <Send size={17} />
-            {isAnalyzing ? 'Analyzing' : 'Send'}
+        <div className="panel-tabs" role="tablist" aria-label="Right panel tabs">
+          <button
+            type="button"
+            className={rightPanelTab === 'chat' ? 'panel-tab active' : 'panel-tab'}
+            onClick={() => setRightPanelTab('chat')}
+            role="tab"
+            aria-selected={rightPanelTab === 'chat'}
+          >
+            <span className="panel-tab-icon" aria-hidden="true">⌘</span>
+            Chat
           </button>
-        </form>
+          <button
+            type="button"
+            className={rightPanelTab === 'tutorials' ? 'panel-tab active' : 'panel-tab'}
+            onClick={() => setRightPanelTab('tutorials')}
+            role="tab"
+            aria-selected={rightPanelTab === 'tutorials'}
+          >
+            <BookOpen size={14} aria-hidden="true" />
+            Tutorials
+          </button>
+        </div>
+
+        {rightPanelTab === 'chat' ? (
+          <>
+            <label className="select-label">
+              Model routing
+              <select value={modelMode} onChange={(event) => setModelMode(event.target.value)}>
+                <option value="Auto">Auto</option>
+                <option value="ForceLocal">Force local</option>
+                <option value="ForceCloud">Force cloud</option>
+              </select>
+            </label>
+
+            <section className="chat-log">
+              {messages
+                .filter((message) => message.role !== 'system')
+                .slice(-7)
+                .map((message, index, arr) => {
+                  const isLastAssistant =
+                    message.role === 'assistant' && index === arr.length - 1;
+                  const content =
+                    isLastAssistant && streamingThesis
+                      ? streamingThesis.displayed
+                      : message.content;
+                  return (
+                    <div className={`message ${message.role}`} key={`${message.role}-${index}`}>
+                      {content}
+                      {isLastAssistant && streamingThesis && (
+                        <span className="cursor-blink">▋</span>
+                      )}
+                    </div>
+                  );
+                })}
+            </section>
+
+            <form className="chat-form" onSubmit={submitAnalysis}>
+              <textarea
+                value={prompt}
+                onChange={(event) => setPrompt(event.target.value)}
+                placeholder="Request a trade plan from current CVD, OI, ATR, and liquidity context."
+              />
+              <div className="position-sizing-row">
+                <label>
+                  Risk %
+                  <input
+                    type="number"
+                    min={0.1}
+                    max={100}
+                    step={0.1}
+                    value={positionSizePct}
+                    onChange={(e) => setPositionSizePct(parseFloat(e.target.value) || 1)}
+                  />
+                </label>
+                <label>
+                  Leverage
+                  <input
+                    type="number"
+                    min={1}
+                    max={125}
+                    step={1}
+                    value={leverage}
+                    onChange={(e) => setLeverage(parseInt(e.target.value, 10) || 1)}
+                  />
+                </label>
+              </div>
+              <button disabled={isAnalyzing || snapshot === null} type="submit">
+                <Send size={17} />
+                {isAnalyzing ? 'Analyzing…' : snapshot === null ? 'Connecting…' : 'Send'}
+              </button>
+            </form>
+          </>
+        ) : (
+          <section className="tutorial-shell">
+            <p className="tutorial-kicker">
+              A quick reference for the indicators and metrics shown in the app.
+            </p>
+            <article
+              className="tutorial-content"
+              dangerouslySetInnerHTML={{ __html: tutorialHtml }}
+            />
+          </section>
+        )}
       </aside>
       {settingsOpen && (
         <div className="modal-backdrop" onClick={() => setSettingsOpen(false)}>

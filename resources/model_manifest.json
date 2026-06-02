@@ -6,9 +6,9 @@
       "size_mb": 2600
     },
     "draft": {
-      "name": "Qwen3-0.6B-Q4_K_M.gguf",
-      "url": "https://huggingface.co/ggml-org/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf",
-      "size_mb": 420
+      "name": "Qwen3-0.6B-Q4_0.gguf",
+      "url": "https://huggingface.co/ggml-org/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_0.gguf",
+      "size_mb": 429
     }
   },
   "mid_range": {

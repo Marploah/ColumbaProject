@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
+use url::Url;
 
 /// Where models are stored. Tauri sets COLUMBA_MODELS_DIR to the app data dir;
 /// make dev falls back to the checked-in resources/models/ directory.
@@ -9,11 +10,43 @@ pub fn models_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("COLUMBA_MODELS_DIR") {
         return PathBuf::from(dir);
     }
+    if let Ok(dir) = std::env::var("COLUMBA_STORAGE_DIR") {
+        return PathBuf::from(dir).join("models");
+    }
     PathBuf::from("resources/models")
 }
 
 pub fn model_path(name: &str) -> PathBuf {
     models_dir().join(name)
+}
+
+fn sanitize_model_name(name: &str) -> Result<&str> {
+    if name.is_empty() {
+        anyhow::bail!("model name is empty");
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        anyhow::bail!("model name contains invalid path characters");
+    }
+    if !name.ends_with(".gguf") {
+        anyhow::bail!("model name must end with .gguf");
+    }
+    Ok(name)
+}
+
+pub fn safe_model_path(name: &str) -> Result<PathBuf> {
+    let sanitized = sanitize_model_name(name)?;
+    Ok(models_dir().join(sanitized))
+}
+
+pub fn validate_model_download_url(url: &str) -> Result<()> {
+    let parsed = Url::parse(url).context("invalid model URL")?;
+    if parsed.scheme() != "https" {
+        anyhow::bail!("model URL must use https");
+    }
+    if parsed.host_str().is_none() {
+        anyhow::bail!("model URL must include a host");
+    }
+    Ok(())
 }
 
 const MIN_VALID_BYTES: u64 = 50 * 1024 * 1024; // 50 MB

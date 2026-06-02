@@ -43,6 +43,12 @@ pub struct TradeLog {
 }
 
 impl TradeLog {
+    fn conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
+        self.conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("trade log mutex poisoned"))
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path).context("failed to open trade log database")?;
         conn.execute_batch(
@@ -82,7 +88,7 @@ impl TradeLog {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "INSERT INTO trade_log
              (created_at, symbol, entry_price, take_profit, stop_loss, thesis, position_size_pct, leverage)
@@ -94,7 +100,7 @@ impl TradeLog {
     }
 
     pub fn update_outcome(&self, id: i64, outcome: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE trade_log SET outcome = ?1 WHERE id = ?2",
             params![outcome, id],
@@ -175,7 +181,7 @@ impl TradeLog {
     }
 
     pub fn recent(&self, limit: usize) -> Result<Vec<TradeRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, created_at, symbol, entry_price, take_profit, stop_loss, thesis, outcome,
@@ -184,7 +190,7 @@ impl TradeLog {
             )
             .context("failed to prepare trade log query")?;
 
-        let records = stmt
+        let rows = stmt
             .query_map(params![limit as i64], |row| {
                 Ok(TradeRecord {
                     id: row.get(0)?,
@@ -199,9 +205,11 @@ impl TradeLog {
                     leverage: row.get(9)?,
                 })
             })
-            .context("failed to query trade log")?
-            .filter_map(|r| r.ok())
-            .collect();
+            .context("failed to query trade log")?;
+
+        let records: Vec<TradeRecord> = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to decode one or more trade log rows")?;
 
         Ok(records)
     }

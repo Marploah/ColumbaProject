@@ -890,7 +890,7 @@ mod tests {
     #[test]
     fn proxy_oi_does_not_produce_strong_long() {
         // Without real OI, even expanding quote_volume should not yield StrongLong
-        let mut candles: Vec<CandleData> = (0..20)
+        let candles: Vec<CandleData> = (0..20)
             .map(|i| {
                 let mut c = make_candle_ohlcv(
                     100.0 + i as f64, 101.0 + i as f64,

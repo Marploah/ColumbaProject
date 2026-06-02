@@ -16,7 +16,7 @@ pub fn select_model_profile(hw: &HardwareProfile) -> ModelProfile {
     match hw.tier {
         HardwareTier::LowEnd => ModelProfile {
             main_model:   "Qwen3-4B-Q4_K_M.gguf".to_string(),
-            draft_model:  "Qwen3-0.6B-Q4_K_M.gguf".to_string(),
+            draft_model:  "Qwen3-0.6B-Q4_0.gguf".to_string(),
             context_size: 4096,
             threads,
             gpu_layers,
